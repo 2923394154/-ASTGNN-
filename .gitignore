@@ -1,0 +1,50 @@
+# Python相关
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 数据文件（太大不适合上传）
+*.pt
+*.pth
+factor_panel_data.csv
+
+# 图片输出（可选择性上传）
+*.png
+
+# 文档PDF（太大）
+*.pdf
+
+# IDE相关
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS相关
+.DS_Store
+
+# 环境变量
+.env
+.venv/
+env/
+venv/
+
+# Jupyter Notebook
+.ipynb_checkpoints 
