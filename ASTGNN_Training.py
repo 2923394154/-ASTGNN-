@@ -40,7 +40,7 @@ from BarraFactorSimulator import BarraFactorSimulator
 class ASTGNNDataset(Dataset):
     """ASTGNN数据集类"""
     
-    def __init__(self, factors, returns, adj_matrices, seq_len=10, prediction_horizon=1):
+    def __init__(self, factors, returns, adj_matrices, seq_len=10, prediction_horizon=5):
         """
         参数：
         - factors: [time, stocks, factors] 因子数据
@@ -477,45 +477,58 @@ def create_data_loaders(factors, returns, adj_matrices,
                        train_ratio=0.7, val_ratio=0.2, 
                        seq_len=10, prediction_horizon=5,
                        batch_size=4, shuffle=True):
-    """创建数据加载器"""
+    """创建数据加载器 - 修复版本"""
     total_periods = factors.shape[0]
     min_required_periods = seq_len + prediction_horizon
+    
+    print(f"数据集参数: 总期数={total_periods}, 序列长度={seq_len}, 预测期={prediction_horizon}")
+    print(f"最小需求期数: {min_required_periods}")
     
     # 检查数据是否足够
     if total_periods < min_required_periods:
         raise ValueError(f"数据不足：需要至少{min_required_periods}期数据，但只有{total_periods}期")
     
-    # 确保每个数据集都有足够的数据  
-    effective_periods = total_periods - min_required_periods + 1
+    # 计算有效样本数（每个数据集可以生成的样本数）
+    max_samples = total_periods - min_required_periods + 1
+    print(f"最大可生成样本数: {max_samples}")
     
-    # 重新计算分割点，确保每部分都有足够样本
-    min_samples_per_set = max(1, min_required_periods)
+    if max_samples < 3:  # 至少需要3个样本才能分割
+        # 动态调整参数
+        new_seq_len = max(3, total_periods // 3)
+        new_pred_horizon = max(1, (total_periods - new_seq_len) // 2)
+        print(f"参数自动调整: seq_len={seq_len}->{new_seq_len}, prediction_horizon={prediction_horizon}->{new_pred_horizon}")
+        seq_len = new_seq_len
+        prediction_horizon = new_pred_horizon
+        min_required_periods = seq_len + prediction_horizon
+        max_samples = total_periods - min_required_periods + 1
     
-    train_periods = max(min_samples_per_set, int(total_periods * train_ratio))
-    val_periods = max(min_samples_per_set, int(total_periods * val_ratio))
+    # 计算数据分割点（基于时间顺序）
+    train_samples = max(1, int(max_samples * train_ratio))
+    val_samples = max(1, int(max_samples * val_ratio))
+    test_samples = max_samples - train_samples - val_samples
     
-    # 调整边界确保不重叠且有效
-    train_end = min(train_periods, total_periods - 2 * min_samples_per_set)
-    val_start = max(train_end - seq_len, 0)  # 允许重叠seq_len期以保证连续性
-    val_end = min(val_start + val_periods, total_periods - min_samples_per_set)
+    print(f"样本分配: 训练={train_samples}, 验证={val_samples}, 测试={test_samples}")
     
-    print(f"数据分割优化: 总期数={total_periods}, 最小需求={min_required_periods}期")
-    print(f"训练: 0到{train_end}期")
-    print(f"验证: {val_start}到{val_end}期") 
-    print(f"测试: {val_end}到{total_periods}期")
+    # 时间分割点
+    train_end_period = seq_len + train_samples - 1
+    val_end_period = train_end_period + val_samples
     
-    # 分割数据
-    train_factors = factors[:train_end]
-    train_returns = returns[:train_end]
-    train_adj = adj_matrices[:train_end]
+    print(f"时间分割点: 训练=[0, {train_end_period}], 验证=[{train_end_period-seq_len+1}, {val_end_period}], 测试=[{val_end_period-seq_len+1}, {total_periods}]")
     
-    val_factors = factors[val_start:val_end]
-    val_returns = returns[val_start:val_end]
-    val_adj = adj_matrices[val_start:val_end]
+    # 分割数据（允许重叠以保证序列连续性）
+    train_factors = factors[:train_end_period + prediction_horizon]
+    train_returns = returns[:train_end_period + prediction_horizon]
+    train_adj = adj_matrices[:train_end_period + prediction_horizon]
     
-    test_factors = factors[val_end:]
-    test_returns = returns[val_end:]
-    test_adj = adj_matrices[val_end:]
+    val_start = max(0, train_end_period - seq_len + 1)
+    val_factors = factors[val_start:val_end_period + prediction_horizon]
+    val_returns = returns[val_start:val_end_period + prediction_horizon]
+    val_adj = adj_matrices[val_start:val_end_period + prediction_horizon]
+    
+    test_start = max(0, val_end_period - seq_len + 1)
+    test_factors = factors[test_start:]
+    test_returns = returns[test_start:]
+    test_adj = adj_matrices[test_start:]
     
     # 创建数据集
     train_dataset = ASTGNNDataset(train_factors, train_returns, train_adj, 
@@ -525,14 +538,35 @@ def create_data_loaders(factors, returns, adj_matrices,
     test_dataset = ASTGNNDataset(test_factors, test_returns, test_adj, 
                                 seq_len, prediction_horizon)
     
-    print(f"数据集大小: 训练={len(train_dataset)}, 验证={len(val_dataset)}, 测试={len(test_dataset)}")
+    print(f"实际数据集大小: 训练={len(train_dataset)}, 验证={len(val_dataset)}, 测试={len(test_dataset)}")
     
-    # 验证数据集不为空
+    # 确保所有数据集都有样本
+    if len(train_dataset) == 0:
+        raise ValueError("训练数据集为空！")
     if len(val_dataset) == 0:
-        raise ValueError("验证数据集为空！请增加数据量或减小seq_len和prediction_horizon参数。")
+        # 如果验证集为空，从训练集分割一部分作为验证集
+        print("验证数据集为空，从训练数据中分割...")
+        val_factors = train_factors[-seq_len-prediction_horizon-1:]
+        val_returns = train_returns[-seq_len-prediction_horizon-1:]
+        val_adj = train_adj[-seq_len-prediction_horizon-1:]
+        val_dataset = ASTGNNDataset(val_factors, val_returns, val_adj, seq_len, prediction_horizon)
+        
+        # 相应缩短训练集
+        train_factors = train_factors[:-prediction_horizon-1]
+        train_returns = train_returns[:-prediction_horizon-1]
+        train_adj = train_adj[:-prediction_horizon-1]
+        train_dataset = ASTGNNDataset(train_factors, train_returns, train_adj, seq_len, prediction_horizon)
+        
+        print(f"重新分割后: 训练={len(train_dataset)}, 验证={len(val_dataset)}")
+    
+    if len(test_dataset) == 0:
+        print("警告：测试数据集为空")
+        # 创建一个最小的测试集
+        test_dataset = ASTGNNDataset(val_factors, val_returns, val_adj, seq_len, prediction_horizon)
     
     # 动态调整batch_size
-    actual_batch_size = min(batch_size, len(train_dataset), len(val_dataset))
+    min_dataset_size = min(len(train_dataset), len(val_dataset))
+    actual_batch_size = min(batch_size, min_dataset_size)
     if actual_batch_size < batch_size:
         print(f"批量大小调整: {batch_size} -> {actual_batch_size}")
     
@@ -545,31 +579,53 @@ def create_data_loaders(factors, returns, adj_matrices,
 
 
 def main_training_pipeline():
-    """主训练流程"""
+    """主训练流程 - 数据期数优化版本"""
     print("=== ASTGNN训练流程 ===")
     
     # 1. 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
     
-    # 2. 加载数据
+    # 2. 智能数据期数设置
+    def determine_optimal_periods():
+        """根据资源和需求确定最优期数"""
+        import psutil
+        available_memory_gb = psutil.virtual_memory().available / (1024**3)
+        
+        if available_memory_gb > 8:
+            return 150  # 高内存：更多期数
+        elif available_memory_gb > 4:
+            return 120  # 中等内存：中等期数
+        else:
+            return 60   # 低内存：较少期数
+    
+    # 3. 加载或生成数据
     try:
         print("加载训练数据...")
         training_data = torch.load('astgnn_training_data.pt', weights_only=False)
         
-        factors = training_data['factors']  # [time, stocks, factors]
-        returns = training_data['returns_standardized']  # [time, stocks]
-        adj_matrices = training_data['adjacency_matrices']  # [time, stocks, stocks]
+        factors = training_data['factors']
+        returns = training_data['returns_standardized']
+        adj_matrices = training_data['adjacency_matrices']
         factor_names = training_data['factor_names']
         
         print(f"数据加载成功: {factors.shape[0]}期, {factors.shape[1]}只股票, {factors.shape[2]}个因子")
         
-    except FileNotFoundError:
-        print("未找到训练数据，生成模拟数据...")
+        # 检查是否需要重新生成更多数据
+        current_periods = factors.shape[0]
+        optimal_periods = determine_optimal_periods()
         
-        # 使用BarraFactorSimulator生成数据
-        simulator = BarraFactorSimulator(num_stocks=200, num_periods=100)
-        sim_data = simulator.simulate_factor_panel_data()
+        if current_periods < optimal_periods:
+            print(f"当前数据期数({current_periods})少于最优期数({optimal_periods})，重新生成...")
+            raise FileNotFoundError("需要重新生成数据")
+            
+    except FileNotFoundError:
+        optimal_periods = determine_optimal_periods()
+        print(f"生成新的训练数据({optimal_periods}期)...")
+        
+        # 使用优化的数据生成
+        simulator = BarraFactorSimulator(num_stocks=200, seed=42)
+        sim_data = simulator.simulate_factor_panel_data_enhanced(num_periods=optimal_periods)
         
         factors = sim_data['factors']
         returns = sim_data['returns_standardized']
@@ -581,30 +637,53 @@ def main_training_pipeline():
             'factors': factors,
             'returns_standardized': returns,
             'adjacency_matrices': adj_matrices,
-            'factor_names': factor_names
+            'factor_names': factor_names,
+            'data_quality': sim_data['data_quality']
         }, 'astgnn_training_data.pt')
         
         print(f"模拟数据生成完成: {factors.shape[0]}期, {factors.shape[1]}只股票, {factors.shape[2]}个因子")
+        print(f"数据质量: IC={sim_data['data_quality']['avg_ic']:.4f}")
     
-    # 3. 创建数据加载器 - 调整参数减少数据需求
+    # 4. 根据数据量优化参数
+    total_periods = factors.shape[0]
+    
+    if total_periods >= 120:
+        seq_len = 15      # 更长序列学习复杂模式
+        prediction_horizon = 5
+        batch_size = 8    # 更大批量
+        num_epochs = 50   # 更多轮次
+    elif total_periods >= 60:
+        seq_len = 12
+        prediction_horizon = 3
+        batch_size = 6
+        num_epochs = 40
+    else:
+        seq_len = 8
+        prediction_horizon = 2
+        batch_size = 4
+        num_epochs = 30
+    
+    print(f"优化参数: 序列长度={seq_len}, 预测期={prediction_horizon}, 批量={batch_size}, 轮次={num_epochs}")
+    
+    # 5. 创建数据加载器
     train_loader, val_loader, test_loader = create_data_loaders(
         factors, returns, adj_matrices,
-        train_ratio=0.6, val_ratio=0.2,  # 剩余0.2用于测试
-        seq_len=5,         # 减少序列长度需求
-        prediction_horizon=2,  # 减少预测范围
-        batch_size=2, shuffle=True
+        train_ratio=0.6, val_ratio=0.2,
+        seq_len=seq_len,
+        prediction_horizon=prediction_horizon,
+        batch_size=batch_size, shuffle=True
     )
     
-    # 4. 创建模型
+    # 6. 创建模型
     print("创建ASTGNN模型...")
     model = ASTGNNFactorModel(
-        sequential_input_size=factors.shape[2],  # 因子数量
+        sequential_input_size=factors.shape[2],
         gru_hidden_size=64,
         gru_num_layers=2,
         gat_hidden_size=128,
         gat_n_heads=4,
         res_hidden_size=128,
-        num_risk_factors=32,  # 风险因子数量
+        num_risk_factors=min(32, factors.shape[2]),  # 避免因子数超过输入维度
         
         tgc_hidden_size=128,
         tgc_output_size=64,
@@ -618,21 +697,21 @@ def main_training_pipeline():
     
     print(f"模型创建完成，参数数量: {sum(p.numel() for p in model.parameters()):,}")
     
-    # 5. 使用现有损失函数（修复）
+    # 7. 创建损失函数
     loss_fn = ASTGNNFactorLoss(
-        omega=0.9,  # 时间衰减权重
-        lambda_orthogonal=0.1,  # 正交惩罚权重
-        max_periods=2,  # 与prediction_horizon保持一致
+        omega=0.9,
+        lambda_orthogonal=0.05,  # 降低正交惩罚
+        max_periods=prediction_horizon,
         regularization_type='frobenius'
     )
     
-    # 6. 创建优化器
+    # 8. 创建优化器
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
     
-    # 7. 创建验证框架
+    # 9. 创建验证框架
     validation_framework = FactorValidationFramework(factor_names=factor_names)
     
-    # 8. 创建训练器
+    # 10. 创建训练器
     trainer = ASTGNNTrainer(
         model=model,
         loss_fn=loss_fn,
@@ -641,19 +720,19 @@ def main_training_pipeline():
         validation_framework=validation_framework
     )
     
-    # 9. 开始训练
+    # 11. 开始训练
     training_results = trainer.train(
         train_loader=train_loader,
         val_loader=val_loader,
-        num_epochs=50,
+        num_epochs=num_epochs,
         save_path='astgnn_best_model.pth',
-        early_stopping_patience=15
+        early_stopping_patience=10
     )
     
-    # 10. 绘制训练历史
+    # 12. 绘制训练历史
     trainer.plot_training_history('astgnn_training_history.png')
     
-    # 11. 测试集评估
+    # 13. 测试集评估
     print("\n=== 测试集评估 ===")
     test_metrics = trainer.validate(test_loader)
     print(f"测试损失: {test_metrics['total_loss']:.4f}")
@@ -662,22 +741,24 @@ def main_training_pipeline():
               f"IR={test_metrics['ic_ir']:.4f}, "
               f"胜率={test_metrics['ic_win_rate']:.4f}")
     
-    print("\n训练完成！")
-    
-    # 12. 基线IC分析
+    # 14. 基线分析
     print("\n=== 基线IC分析 ===")
-    baseline_ic = validation_framework.compute_information_coefficient(factors[:-1], returns[1:])
-    print(f"基线因子IC均值: {np.mean(np.abs(baseline_ic['ic_mean'])):.4f}")
+    try:
+        baseline_ic = validation_framework.compute_information_coefficient(factors[:-1], returns[1:])
+        print(f"原始因子IC均值: {np.mean(np.abs(baseline_ic['ic_mean'])):.4f}")
+        
+        # 检查个别因子的预测能力
+        print("\n原始因子预测能力分析:")
+        for i in range(min(5, factors.shape[2])):
+            corr = np.corrcoef(factors[:-1, :, i].flatten(), returns[1:].flatten())[0, 1]
+            print(f"  {factor_names[i] if i < len(factor_names) else f'Factor_{i}'}: 相关性={corr:.4f}")
+    except Exception as e:
+        print(f"基线分析失败: {e}")
     
-    # 检查收益率的预测性
-    print("\n=== 原始因子预测能力分析 ===")
-    for i in range(min(5, factors.shape[2])):
-        corr = np.corrcoef(factors[:-1, :, i].flatten(), returns[1:].flatten())[0, 1]
-        print(f"原始因子{i}与未来收益相关性: {corr:.4f}")
+    print("\n训练完成！")
     
     return trainer, training_results
 
 
 if __name__ == "__main__":
-    # 运行训练流程
     trainer, results = main_training_pipeline() 

@@ -14,7 +14,7 @@ class ASTGNNFactorLoss(nn.Module):
     损失函数: ∑ ω^(t-1) R-square(F, y_t) + λ ||corr(F, F)||_2
     """
     
-    def __init__(self, omega=0.9, lambda_orthogonal=0.1, max_periods=5, 
+    def __init__(self, omega=0.9, lambda_orthogonal=0.05, max_periods=5, 
                  eps=1e-8, regularization_type='frobenius'):
         """
         参数：

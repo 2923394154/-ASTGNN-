@@ -76,9 +76,9 @@ class FactorValidationFramework:
             num_periods, num_stocks, num_factors = factors.shape
             ic_series = []
             
-            for t in range(num_periods - 1):  # 避免最后一期没有未来收益
+            for t in range(num_periods):  # 修复：已经在调用时正确对齐
                 factor_t = factors[t].numpy()  # [stocks, factors]
-                return_t1 = returns[t + 1].numpy()  # [stocks] 下期收益
+                return_t1 = returns[t].numpy()  # [stocks] 对应收益（调用时已偏移）
                 
                 # 计算当期因子与下期收益的相关性
                 period_ic = []
