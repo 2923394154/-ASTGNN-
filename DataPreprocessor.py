@@ -404,32 +404,40 @@ class ASTGNNDataPreprocessor:
         # 创建序列
         sequences = []
         targets = []
+        factor_targets = []  # 新增：未来因子作为目标
         
         for i in range(len(dates) - sequence_length - prediction_horizon + 1):
             # 输入序列
             seq_factors = factor_array[i:i+sequence_length]
             seq_returns = return_array[i:i+sequence_length]
             
-            # 目标序列
+            # 目标序列：使用未来时点的收益率
             target_returns = return_array[i+sequence_length:i+sequence_length+prediction_horizon]
+            
+            # 新增：未来因子值作为多因子预测目标
+            target_factors = factor_array[i+sequence_length:i+sequence_length+prediction_horizon]
             
             sequences.append({
                 'factors': seq_factors,
                 'returns': seq_returns
             })
             targets.append(target_returns)
+            factor_targets.append(target_factors)
         
         # 转换为tensor
         factor_sequences = torch.tensor([seq['factors'] for seq in sequences], dtype=torch.float32)
         return_sequences = torch.tensor([seq['returns'] for seq in sequences], dtype=torch.float32)
         target_sequences = torch.tensor(targets, dtype=torch.float32)
+        factor_target_sequences = torch.tensor(factor_targets, dtype=torch.float32)  # 新增
         
         logger.info(f"序列创建完成: {factor_sequences.shape}")
+        logger.info(f"因子目标序列形状: {factor_target_sequences.shape}")
         
         return {
             'factor_sequences': factor_sequences,
             'return_sequences': return_sequences,
             'target_sequences': target_sequences,
+            'factor_target_sequences': factor_target_sequences,  # 新增：多因子预测目标
             'factor_names': factor_cols,
             'stock_ids': stocks,
             'dates': dates[sequence_length:len(dates)-prediction_horizon+1]
@@ -504,19 +512,22 @@ class ASTGNNDataPreprocessor:
         train_data = {
             'factor_sequences': sequences['factor_sequences'][:train_size],
             'return_sequences': sequences['return_sequences'][:train_size],
-            'target_sequences': sequences['target_sequences'][:train_size]
+            'target_sequences': sequences['target_sequences'][:train_size],
+            'factor_target_sequences': sequences.get('factor_target_sequences', sequences['target_sequences'])[:train_size]
         }
         
         val_data = {
             'factor_sequences': sequences['factor_sequences'][train_size:train_size+val_size],
             'return_sequences': sequences['return_sequences'][train_size:train_size+val_size],
-            'target_sequences': sequences['target_sequences'][train_size:train_size+val_size]
+            'target_sequences': sequences['target_sequences'][train_size:train_size+val_size],
+            'factor_target_sequences': sequences.get('factor_target_sequences', sequences['target_sequences'])[train_size:train_size+val_size]
         }
         
         test_data = {
             'factor_sequences': sequences['factor_sequences'][train_size+val_size:],
             'return_sequences': sequences['return_sequences'][train_size+val_size:],
-            'target_sequences': sequences['target_sequences'][train_size+val_size:]
+            'target_sequences': sequences['target_sequences'][train_size+val_size:],
+            'factor_target_sequences': sequences.get('factor_target_sequences', sequences['target_sequences'])[train_size+val_size:]
         }
         
         logger.info(f"数据分割完成 - 训练: {train_data['factor_sequences'].shape[0]}, "
@@ -674,6 +685,150 @@ class ASTGNNDataPreprocessor:
         logger.info("4. 已进行标准化和异常值处理")
         
         return final_data
+    
+    def diagnose_data_quality(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """诊断数据质量"""
+        logger.info("开始数据质量诊断")
+        
+        diagnosis = {
+            'data_shape': data.shape,
+            'date_range': (data['date'].min(), data['date'].max()),
+            'unique_stocks': data['StockID'].nunique(),
+            'total_stocks': len(data['StockID'].unique()),
+            'missing_values': {},
+            'data_coverage': {},
+            'factor_analysis': {},
+            'time_series_analysis': {}
+        }
+        
+        # 检查缺失值
+        for col in data.columns:
+            missing_count = data[col].isnull().sum()
+            missing_pct = missing_count / len(data) * 100
+            diagnosis['missing_values'][col] = {
+                'count': missing_count,
+                'percentage': missing_pct
+            }
+        
+        # 检查因子列
+        factor_cols = [col for col in data.columns if col.startswith('Exposure_')]
+        diagnosis['factor_analysis'] = {
+            'factor_count': len(factor_cols),
+            'factor_names': factor_cols,
+            'factor_stats': {}
+        }
+        
+        # 因子统计信息
+        for factor in factor_cols:
+            factor_data = data[factor].dropna()
+            diagnosis['factor_analysis']['factor_stats'][factor] = {
+                'mean': factor_data.mean(),
+                'std': factor_data.std(),
+                'min': factor_data.min(),
+                'max': factor_data.max(),
+                'skewness': factor_data.skew(),
+                'kurtosis': factor_data.kurtosis()
+            }
+        
+        # 时间序列分析
+        dates = sorted(data['date'].unique())
+        diagnosis['time_series_analysis'] = {
+            'total_dates': len(dates),
+            'date_gaps': self._find_date_gaps(dates),
+            'stocks_per_date': data.groupby('date')['StockID'].nunique().describe().to_dict(),
+            'observations_per_stock': data.groupby('StockID').size().describe().to_dict()
+        }
+        
+        # 数据覆盖率分析
+        total_expected = len(dates) * diagnosis['unique_stocks']
+        actual_observations = len(data)
+        diagnosis['data_coverage'] = {
+            'expected_observations': total_expected,
+            'actual_observations': actual_observations,
+            'coverage_rate': actual_observations / total_expected * 100 if total_expected > 0 else 0
+        }
+        
+        logger.info("数据质量诊断完成")
+        return diagnosis
+    
+    def _find_date_gaps(self, dates: List) -> List[Tuple]:
+        """查找日期间隙"""
+        gaps = []
+        dates = pd.to_datetime(dates)
+        
+        for i in range(1, len(dates)):
+            gap_days = (dates[i] - dates[i-1]).days
+            if gap_days > 7:  # 假设正常间隔不超过7天
+                gaps.append((dates[i-1], dates[i], gap_days))
+        
+        return gaps
+    
+    def validate_data_consistency(self, stock_data: pd.DataFrame, barra_data: pd.DataFrame) -> Dict[str, Any]:
+        """验证两个数据集的一致性"""
+        logger.info("验证数据一致性")
+        
+        validation = {
+            'stock_date_range': (stock_data['date'].min(), stock_data['date'].max()),
+            'barra_date_range': (barra_data['date'].min(), barra_data['date'].max()),
+            'common_stocks': set(stock_data['StockID']).intersection(set(barra_data['StockID'])),
+            'stock_only': set(stock_data['StockID']) - set(barra_data['StockID']),
+            'barra_only': set(barra_data['StockID']) - set(stock_data['StockID']),
+            'overlap_analysis': {}
+        }
+        
+        # 分析重叠情况
+        common_stocks = validation['common_stocks']
+        validation['overlap_analysis'] = {
+            'common_stock_count': len(common_stocks),
+            'stock_only_count': len(validation['stock_only']),
+            'barra_only_count': len(validation['barra_only']),
+            'overlap_rate': len(common_stocks) / max(len(set(stock_data['StockID'])), len(set(barra_data['StockID']))) * 100
+        }
+        
+        # 日期重叠分析
+        stock_dates = set(stock_data['date'])
+        barra_dates = set(barra_data['date'])
+        common_dates = stock_dates.intersection(barra_dates)
+        
+        validation['date_overlap'] = {
+            'common_dates': len(common_dates),
+            'stock_only_dates': len(stock_dates - barra_dates),
+            'barra_only_dates': len(barra_dates - stock_dates),
+            'date_overlap_rate': len(common_dates) / max(len(stock_dates), len(barra_dates)) * 100
+        }
+        
+        logger.info("数据一致性验证完成")
+        return validation
+    
+    def print_diagnosis_report(self, diagnosis: Dict[str, Any]):
+        """打印诊断报告"""
+        print("\n" + "="*60)
+        print("数据质量诊断报告")
+        print("="*60)
+        
+        print(f"数据形状: {diagnosis['data_shape']}")
+        print(f"时间范围: {diagnosis['date_range'][0]} 到 {diagnosis['date_range'][1]}")
+        print(f"股票数量: {diagnosis['unique_stocks']}")
+        print(f"因子数量: {diagnosis['factor_analysis']['factor_count']}")
+        
+        print(f"\n数据覆盖率: {diagnosis['data_coverage']['coverage_rate']:.2f}%")
+        print(f"期望观测数: {diagnosis['data_coverage']['expected_observations']:,}")
+        print(f"实际观测数: {diagnosis['data_coverage']['actual_observations']:,}")
+        
+        print(f"\n时间序列分析:")
+        print(f"  总日期数: {diagnosis['time_series_analysis']['total_dates']}")
+        print(f"  日期间隙: {len(diagnosis['time_series_analysis']['date_gaps'])} 个")
+        
+        print(f"\n缺失值情况:")
+        high_missing_cols = [(k, v['percentage']) for k, v in diagnosis['missing_values'].items() 
+                           if v['percentage'] > 10]
+        if high_missing_cols:
+            for col, pct in high_missing_cols[:5]:  # 显示前5个高缺失率列
+                print(f"  {col}: {pct:.2f}%")
+        else:
+            print("  所有列缺失率都低于10%")
+        
+        print("="*60)
 
 
 def main():
