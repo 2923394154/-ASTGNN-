@@ -29,7 +29,7 @@ stock_price_vol_d.txt
 barra_Exposure(2).
 
 # 图片输出（可选择性上传）
-*.png
+# *.png
 
 # 文档PDF（太大）
 *.pdf
