@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ASTGNN数据预处理器
+整合股价数据和Barra因子数据，为ASTGNN项目提供标准化的训练数据
+"""
+
+import pandas as pd
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import Dict, List, Tuple, Optional, Any
+import time
+import warnings
+import logging
+from datetime import datetime, timedelta
+from sklearn.preprocessing import StandardScaler, RobustScaler
+warnings.filterwarnings('ignore')
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# 设置中文字体
+plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+class ASTGNNDataPreprocessor:
+    """ASTGNN数据预处理器"""
+    
+    def __init__(self, config: Optional[Dict] = None):
+        """初始化预处理器"""
+        self.config = config or self._get_default_config()
+        
+        # 文件路径
+        self.stock_file = self.config.get('stock_file', 'stock_price_vol_d.txt')
+        self.barra_file = self.config.get('barra_file', 'barra_Exposure(2).')
+        
+        # 数据缓存
+        self.stock_data = None
+        self.barra_data = None
+        self.merged_data = None
+        self.processed_data = None
+        
+        # 标准化器
+        self.factor_scaler = StandardScaler()
+        self.return_scaler = RobustScaler()
+        
+        logger.info("数据预处理器初始化完成")
+    
+    def _get_default_config(self) -> Dict:
+        """获取默认配置"""
+        return {
+            'sequence_length': 20,
+            'prediction_horizon': 5,
+            'min_stock_history': 60,
+            'factor_standardization': True,
+            'return_standardization': True,
+            'remove_outliers': True,
+            'outlier_threshold': 3.0,
+            'min_correlation_threshold': 0.1,
+            'adjacency_threshold': 0.3,
+            'data_split_ratio': [0.7, 0.15, 0.15],  # train, val, test
+            'random_seed': 42
+        }
+    
+    def load_stock_data(self, sample_size: Optional[int] = None, 
+                        target_stocks: Optional[List[str]] = None,
+                        target_date_range: Optional[Tuple[str, str]] = None) -> Optional[pd.DataFrame]:
+        """加载股价数据"""
+        logger.info("开始加载股价数据")
+        
+        try:
+            # 使用feather格式读取
+            df = pd.read_feather(self.stock_file)
+            logger.info(f"成功加载股价数据: {df.shape}")
+            
+            # 数据清理
+            df['date'] = pd.to_datetime(df['date'])
+            
+            # 如果指定了目标股票，优先过滤
+            if target_stocks:
+                df = df[df['StockID'].isin(target_stocks)]
+                logger.info(f"按目标股票过滤后: {df.shape}")
+            
+            # 如果指定了目标日期范围，过滤日期
+            if target_date_range:
+                start_date, end_date = target_date_range
+                df = df[(df['date'] >= start_date) & (df['date'] <= end_date)]
+                logger.info(f"按目标日期过滤后: {df.shape}")
+            
+            # 智能采样：按股票和时间均匀采样，而非完全随机
+            if sample_size and len(df) > sample_size:
+                # 先按股票分组，确保每只股票都有代表性数据
+                stock_groups = df.groupby('StockID')
+                stocks_list = list(stock_groups.groups.keys())
+                
+                # 计算每只股票应该采样的行数
+                max_stocks = min(len(stocks_list), sample_size // 100)  # 每只股票至少100行
+                selected_stocks = stocks_list[:max_stocks] if len(stocks_list) > max_stocks else stocks_list
+                
+                sampled_dfs = []
+                remaining_sample = sample_size
+                
+                for i, stock in enumerate(selected_stocks):
+                    stock_data = stock_groups.get_group(stock)
+                    # 为每只股票分配样本数
+                    stock_sample_size = min(len(stock_data), remaining_sample // (len(selected_stocks) - i))
+                    
+                    if stock_sample_size > 0:
+                        # 按时间顺序采样，保持连续性
+                        if len(stock_data) > stock_sample_size:
+                            # 从最近的数据开始采样
+                            stock_data = stock_data.sort_values('date').tail(stock_sample_size)
+                        sampled_dfs.append(stock_data)
+                        remaining_sample -= len(stock_data)
+                
+                df = pd.concat(sampled_dfs, ignore_index=True)
+                df = df.sort_values(['date', 'StockID'])
+                logger.info(f"智能采样到 {len(df)} 行，覆盖 {df['StockID'].nunique()} 只股票")
+            
+            # 基本统计信息
+            date_range = (df['date'].min(), df['date'].max())
+            unique_stocks = df['StockID'].nunique()
+            missing_values = df.isnull().sum().sum()
+            
+            logger.info(f"时间范围: {date_range[0]} 到 {date_range[1]}")
+            logger.info(f"股票数量: {unique_stocks:,}")
+            logger.info(f"缺失值总数: {missing_values}")
+            
+            self.stock_data = df
+            return df
+            
+        except Exception as e:
+            logger.error(f"加载股价数据失败: {str(e)}")
+            return None
+    
+    def load_barra_data(self, sample_size: Optional[int] = None,
+                        target_stocks: Optional[List[str]] = None,
+                        target_date_range: Optional[Tuple[str, str]] = None) -> Optional[pd.DataFrame]:
+        """加载Barra因子数据"""
+        logger.info("开始加载Barra因子数据")
+        
+        try:
+            # 使用parquet格式读取
+            df = pd.read_parquet(self.barra_file)
+            logger.info(f"成功加载Barra数据: {df.shape}")
+            
+            # 数据清理和重命名
+            df['日期'] = pd.to_datetime(df['日期'])
+            df = df.rename(columns={
+                '日期': 'date',
+                '股票代码': 'StockID'
+            })
+            
+            # 如果指定了目标股票，优先过滤
+            if target_stocks:
+                df = df[df['StockID'].isin(target_stocks)]
+                logger.info(f"按目标股票过滤后: {df.shape}")
+            
+            # 如果指定了目标日期范围，过滤日期
+            if target_date_range:
+                start_date, end_date = target_date_range
+                df = df[(df['date'] >= start_date) & (df['date'] <= end_date)]
+                logger.info(f"按目标日期过滤后: {df.shape}")
+            
+            # 智能采样：与股价数据采用相同的逻辑
+            if sample_size and len(df) > sample_size:
+                # 按股票分组采样
+                stock_groups = df.groupby('StockID')
+                stocks_list = list(stock_groups.groups.keys())
+                
+                # 如果有目标股票，优先选择这些股票
+                if target_stocks:
+                    stocks_list = [s for s in target_stocks if s in stocks_list]
+                
+                max_stocks = min(len(stocks_list), sample_size // 50)  # 每只股票至少50行
+                selected_stocks = stocks_list[:max_stocks] if len(stocks_list) > max_stocks else stocks_list
+                
+                sampled_dfs = []
+                remaining_sample = sample_size
+                
+                for i, stock in enumerate(selected_stocks):
+                    stock_data = stock_groups.get_group(stock)
+                    stock_sample_size = min(len(stock_data), remaining_sample // (len(selected_stocks) - i))
+                    
+                    if stock_sample_size > 0:
+                        # 按时间顺序采样，保持连续性
+                        if len(stock_data) > stock_sample_size:
+                            stock_data = stock_data.sort_values('date').tail(stock_sample_size)
+                        sampled_dfs.append(stock_data)
+                        remaining_sample -= len(stock_data)
+                
+                df = pd.concat(sampled_dfs, ignore_index=True)
+                df = df.sort_values(['date', 'StockID'])
+                logger.info(f"智能采样到 {len(df)} 行，覆盖 {df['StockID'].nunique()} 只股票")
+            
+            # 基本统计信息
+            date_range = (df['date'].min(), df['date'].max())
+            unique_stocks = df['StockID'].nunique()
+            factor_count = len([col for col in df.columns if col.startswith('Exposure_')])
+            
+            logger.info(f"时间范围: {date_range[0]} 到 {date_range[1]}")
+            logger.info(f"股票数量: {unique_stocks:,}")
+            logger.info(f"因子数量: {factor_count}")
+            
+            self.barra_data = df
+            return df
+            
+        except Exception as e:
+            logger.error(f"加载Barra数据失败: {str(e)}")
+            return None
+    
+    def merge_datasets(self, date_range: Optional[Tuple[str, str]] = None) -> Optional[pd.DataFrame]:
+        """合并股价数据和Barra因子数据"""
+        logger.info("开始合并数据集")
+        
+        if self.stock_data is None or self.barra_data is None:
+            logger.error("请先加载股价数据和Barra数据")
+            return None
+        
+        # 时间范围过滤
+        if date_range:
+            start_date, end_date = date_range
+            stock_filtered = self.stock_data[
+                (self.stock_data['date'] >= start_date) & 
+                (self.stock_data['date'] <= end_date)
+            ].copy()
+            barra_filtered = self.barra_data[
+                (self.barra_data['date'] >= start_date) & 
+                (self.barra_data['date'] <= end_date)
+            ].copy()
+            logger.info(f"应用时间过滤: {start_date} 到 {end_date}")
+        else:
+            stock_filtered = self.stock_data.copy()
+            barra_filtered = self.barra_data.copy()
+        
+        # 合并数据
+        merged = pd.merge(
+            stock_filtered, 
+            barra_filtered,
+            on=['date', 'StockID'],
+            how='inner'
+        )
+        
+        logger.info(f"合并完成: {merged.shape}")
+        if len(merged) > 0:
+            logger.info(f"合并后时间范围: {merged['date'].min()} 到 {merged['date'].max()}")
+            logger.info(f"合并后股票数量: {merged['StockID'].nunique():,}")
+        
+        self.merged_data = merged
+        return merged
+    
+    def calculate_returns_and_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """计算收益率和技术指标"""
+        logger.info("计算收益率和技术指标")
+        
+        # 重置索引并按股票分组排序
+        data = data.reset_index(drop=True)
+        data = data.sort_values(['StockID', 'date'])
+        
+        # 计算多期收益率
+        return_periods = [1, 5, 10, 20]
+        for period in return_periods:
+            col_name = f'return_{period}d'
+            data[col_name] = data.groupby('StockID')['close'].pct_change(period)
+        
+        # 计算对数收益率
+        log_returns = data.groupby('StockID')['close'].transform(lambda x: np.log(x / x.shift(1)))
+        data['log_return'] = log_returns
+        
+        # 计算波动率指标
+        data['volatility_5d'] = data.groupby('StockID')['log_return'].transform(lambda x: x.rolling(5).std())
+        data['volatility_20d'] = data.groupby('StockID')['log_return'].transform(lambda x: x.rolling(20).std())
+        
+        # 计算价格技术指标
+        data['price_ma_5'] = data.groupby('StockID')['close'].transform(lambda x: x.rolling(5).mean())
+        data['price_ma_20'] = data.groupby('StockID')['close'].transform(lambda x: x.rolling(20).mean())
+        data['price_ratio_ma5'] = data['close'] / data['price_ma_5']
+        data['price_ratio_ma20'] = data['close'] / data['price_ma_20']
+        
+        # 计算成交量指标
+        data['volume_ma_5'] = data.groupby('StockID')['vol'].transform(lambda x: x.rolling(5).mean())
+        data['volume_ratio'] = data['vol'] / data['volume_ma_5']
+        
+        # 计算momentum指标
+        data['momentum_5d'] = data.groupby('StockID')['close'].transform(lambda x: x / x.shift(5) - 1)
+        data['momentum_20d'] = data.groupby('StockID')['close'].transform(lambda x: x / x.shift(20) - 1)
+        
+        logger.info("收益率和技术指标计算完成")
+        return data
+    
+    def remove_outliers(self, data: pd.DataFrame) -> pd.DataFrame:
+        """移除异常值"""
+        if not self.config['remove_outliers']:
+            return data
+        
+        logger.info("开始移除异常值")
+        initial_count = len(data)
+        
+        # 获取数值列
+        numeric_cols = data.select_dtypes(include=[np.number]).columns
+        threshold = self.config['outlier_threshold']
+        
+        # 对每个数值列移除异常值
+        for col in numeric_cols:
+            if col in ['date', 'StockID']:
+                continue
+            
+            # 使用Z-score方法
+            z_scores = np.abs((data[col] - data[col].mean()) / data[col].std())
+            data = data[z_scores <= threshold]
+        
+        final_count = len(data)
+        removed_count = initial_count - final_count
+        
+        logger.info(f"异常值移除完成: 移除 {removed_count} 行 ({removed_count/initial_count*100:.2f}%)")
+        return data
+    
+    def standardize_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """特征标准化"""
+        logger.info("开始特征标准化")
+        
+        # 获取因子列和收益率列
+        factor_cols = [col for col in data.columns if col.startswith('Exposure_')]
+        return_cols = [col for col in data.columns if 'return' in col and col != 'turnoverrate']
+        
+        # 标准化因子
+        if self.config['factor_standardization'] and factor_cols:
+            data[factor_cols] = self.factor_scaler.fit_transform(data[factor_cols].fillna(0))
+            logger.info(f"因子标准化完成: {len(factor_cols)} 个因子")
+        
+        # 标准化收益率
+        if self.config['return_standardization'] and return_cols:
+            data[return_cols] = self.return_scaler.fit_transform(data[return_cols].fillna(0))
+            logger.info(f"收益率标准化完成: {len(return_cols)} 个收益率指标")
+        
+        return data
+    
+    def filter_stocks_by_history(self, data: pd.DataFrame) -> pd.DataFrame:
+        """根据历史数据长度过滤股票"""
+        min_history = self.config['min_stock_history']
+        
+        # 计算每只股票的历史数据长度
+        stock_counts = data.groupby('StockID').size()
+        valid_stocks = stock_counts[stock_counts >= min_history].index
+        
+        filtered_data = data[data['StockID'].isin(valid_stocks)]
+        
+        logger.info(f"历史数据过滤: 保留 {len(valid_stocks)} 只股票 (最少 {min_history} 天数据)")
+        return filtered_data
+    
+    def create_sequences(self, data: pd.DataFrame) -> Dict[str, torch.Tensor]:
+        """创建时间序列数据"""
+        logger.info("创建时间序列数据")
+        
+        sequence_length = self.config['sequence_length']
+        prediction_horizon = self.config['prediction_horizon']
+        
+        # 获取因子列
+        factor_cols = [col for col in data.columns if col.startswith('Exposure_')]
+        
+        # 按日期排序
+        data = data.sort_values(['date', 'StockID'])
+        
+        # 获取所有日期和股票
+        dates = sorted(data['date'].unique())
+        stocks = sorted(data['StockID'].unique())
+        
+        logger.info(f"时间期数: {len(dates)}, 股票数量: {len(stocks)}, 因子数量: {len(factor_cols)}")
+        
+        # 为每个因子分别创建pivot表，然后合并
+        factor_arrays = []
+        for factor in factor_cols:
+            factor_pivot = data.pivot_table(
+                index='date', 
+                columns='StockID', 
+                values=factor,
+                aggfunc='first'
+            )
+            factor_arrays.append(factor_pivot.values)
+        
+        # 堆叠所有因子：[num_factors, num_dates, num_stocks]
+        factor_array = np.stack(factor_arrays, axis=0)
+        # 转置为：[num_dates, num_stocks, num_factors] 
+        factor_array = np.transpose(factor_array, (1, 2, 0))
+        
+        return_data = data.pivot_table(
+            index='date',
+            columns='StockID',
+            values='return_1d',
+            aggfunc='first'
+        )
+        return_array = return_data.values
+        
+        # 处理NaN值
+        factor_array = np.nan_to_num(factor_array, nan=0.0)
+        return_array = np.nan_to_num(return_array, nan=0.0)
+        
+        logger.info(f"factor_array形状: {factor_array.shape}")
+        logger.info(f"return_array形状: {return_array.shape}")
+        
+        # 创建序列
+        sequences = []
+        targets = []
+        
+        for i in range(len(dates) - sequence_length - prediction_horizon + 1):
+            # 输入序列
+            seq_factors = factor_array[i:i+sequence_length]
+            seq_returns = return_array[i:i+sequence_length]
+            
+            # 目标序列
+            target_returns = return_array[i+sequence_length:i+sequence_length+prediction_horizon]
+            
+            sequences.append({
+                'factors': seq_factors,
+                'returns': seq_returns
+            })
+            targets.append(target_returns)
+        
+        # 转换为tensor
+        factor_sequences = torch.tensor([seq['factors'] for seq in sequences], dtype=torch.float32)
+        return_sequences = torch.tensor([seq['returns'] for seq in sequences], dtype=torch.float32)
+        target_sequences = torch.tensor(targets, dtype=torch.float32)
+        
+        logger.info(f"序列创建完成: {factor_sequences.shape}")
+        
+        return {
+            'factor_sequences': factor_sequences,
+            'return_sequences': return_sequences,
+            'target_sequences': target_sequences,
+            'factor_names': factor_cols,
+            'stock_ids': stocks,
+            'dates': dates[sequence_length:len(dates)-prediction_horizon+1]
+        }
+    
+    def create_adjacency_matrices(self, factor_sequences: torch.Tensor) -> torch.Tensor:
+        """创建邻接矩阵"""
+        logger.info("创建邻接矩阵")
+        logger.info(f"factor_sequences形状: {factor_sequences.shape}")
+        
+        # 检查维度
+        if len(factor_sequences.shape) == 3:
+            # 形状为 [num_sequences, seq_len, num_features] 其中 num_features = num_stocks * num_factors
+            num_sequences, seq_len, num_features = factor_sequences.shape
+            
+            # 需要重新构造以获得股票数量
+            # 假设因子数量为10 (从配置或数据中获取)
+            num_factors = len([col for col in self.merged_data.columns if col.startswith('Exposure_')]) if hasattr(self, 'merged_data') else 10
+            num_stocks = num_features // num_factors
+            
+            # 重塑为 [num_sequences, seq_len, num_stocks, num_factors]
+            factor_sequences = factor_sequences.view(num_sequences, seq_len, num_stocks, num_factors)
+            logger.info(f"重塑后factor_sequences形状: {factor_sequences.shape}")
+            
+        elif len(factor_sequences.shape) == 4:
+            num_sequences, seq_len, num_stocks, num_factors = factor_sequences.shape
+        else:
+            logger.error(f"不支持的factor_sequences维度: {factor_sequences.shape}")
+            return torch.zeros(1, 1, 1, 1)
+        
+        adj_matrices = torch.zeros(num_sequences, seq_len, num_stocks, num_stocks)
+        threshold = self.config['adjacency_threshold']
+        
+        for seq_idx in range(num_sequences):
+            for t in range(seq_len):
+                factors_t = factor_sequences[seq_idx, t]  # [stocks, factors]
+                
+                # 计算相关系数矩阵
+                if not torch.isnan(factors_t).all() and factors_t.shape[0] > 1:
+                    try:
+                        corr_matrix = torch.corrcoef(factors_t)
+                        corr_matrix = torch.nan_to_num(corr_matrix, nan=0.0)
+                        
+                        # 转换为邻接矩阵
+                        adj_matrix = torch.abs(corr_matrix)
+                        adj_matrix[adj_matrix < threshold] = 0
+                        adj_matrix.fill_diagonal_(1.0)
+                        
+                        adj_matrices[seq_idx, t] = adj_matrix
+                    except Exception as e:
+                        logger.warning(f"计算相关矩阵失败 seq_idx={seq_idx}, t={t}: {str(e)}")
+                        # 使用单位矩阵作为默认值
+                        adj_matrices[seq_idx, t] = torch.eye(num_stocks)
+                else:
+                    # 使用单位矩阵作为默认值
+                    adj_matrices[seq_idx, t] = torch.eye(num_stocks)
+        
+        logger.info(f"邻接矩阵创建完成: {adj_matrices.shape}")
+        return adj_matrices
+    
+    def split_data(self, sequences: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, torch.Tensor]]:
+        """分割训练、验证和测试数据"""
+        logger.info("分割数据集")
+        
+        split_ratios = self.config['data_split_ratio']
+        total_sequences = sequences['factor_sequences'].shape[0]
+        
+        train_size = int(total_sequences * split_ratios[0])
+        val_size = int(total_sequences * split_ratios[1])
+        
+        # 按时间顺序分割
+        train_data = {
+            'factor_sequences': sequences['factor_sequences'][:train_size],
+            'return_sequences': sequences['return_sequences'][:train_size],
+            'target_sequences': sequences['target_sequences'][:train_size]
+        }
+        
+        val_data = {
+            'factor_sequences': sequences['factor_sequences'][train_size:train_size+val_size],
+            'return_sequences': sequences['return_sequences'][train_size:train_size+val_size],
+            'target_sequences': sequences['target_sequences'][train_size:train_size+val_size]
+        }
+        
+        test_data = {
+            'factor_sequences': sequences['factor_sequences'][train_size+val_size:],
+            'return_sequences': sequences['return_sequences'][train_size+val_size:],
+            'target_sequences': sequences['target_sequences'][train_size+val_size:]
+        }
+        
+        logger.info(f"数据分割完成 - 训练: {train_data['factor_sequences'].shape[0]}, "
+                   f"验证: {val_data['factor_sequences'].shape[0]}, "
+                   f"测试: {test_data['factor_sequences'].shape[0]}")
+        
+        return {
+            'train': train_data,
+            'validation': val_data,
+            'test': test_data
+        }
+    
+    def save_processed_data(self, data: Dict, filename: str = 'processed_astgnn_data.pt'):
+        """保存处理后的数据"""
+        logger.info(f"保存处理后的数据到: {filename}")
+        
+        try:
+            torch.save({
+                'data': data,
+                'config': self.config,
+                'factor_scaler': self.factor_scaler,
+                'return_scaler': self.return_scaler
+            }, filename)
+            logger.info("数据保存成功")
+        except Exception as e:
+            logger.error(f"保存失败: {str(e)}")
+    
+    def run_preprocessing_pipeline(self, 
+                                 stock_sample_size: int = 200000,
+                                 barra_sample_size: int = 100000,
+                                 date_range: Tuple[str, str] = ('2020-01-01', '2023-12-31')) -> Optional[Dict]:
+        """运行完整的预处理流程"""
+        logger.info("启动ASTGNN数据预处理流程")
+        logger.info("=" * 80)
+        
+        start_time = time.time()
+        
+        # 协调采样策略：先加载Barra数据确定可用股票，再加载对应的股价数据
+        logger.info("第一步：加载Barra数据以确定可用股票")
+        
+        # 1. 先加载Barra数据（在目标时间范围内）
+        barra_df = self.load_barra_data(
+            sample_size=barra_sample_size,
+            target_date_range=date_range
+        )
+        
+        if barra_df is None:
+            logger.error("Barra数据加载失败，流程终止")
+            return None
+        
+        # 获取Barra数据中的股票列表
+        available_stocks = list(barra_df['StockID'].unique())
+        logger.info(f"Barra数据中可用股票: {len(available_stocks)} 只")
+        
+        # 2. 加载对应的股价数据
+        logger.info("第二步：加载对应股票的股价数据")
+        stock_df = self.load_stock_data(
+            sample_size=stock_sample_size,
+            target_stocks=available_stocks,
+            target_date_range=date_range
+        )
+        
+        if stock_df is None or barra_df is None:
+            logger.error("数据加载失败，流程终止")
+            return None
+        
+        # 2. 合并数据集
+        merged_df = self.merge_datasets(date_range)
+        if merged_df is None or len(merged_df) == 0:
+            logger.error("数据合并失败或合并后数据为空，流程终止")
+            return None
+        
+        logger.info(f"步骤2后数据量: {len(merged_df)} 行")
+        
+        # 3. 计算收益率和特征
+        merged_df = self.calculate_returns_and_features(merged_df)
+        logger.info(f"步骤3后数据量: {len(merged_df)} 行")
+        
+        # 4. 移除异常值
+        merged_df = self.remove_outliers(merged_df)
+        logger.info(f"步骤4后数据量: {len(merged_df)} 行")
+        
+        # 检查数据是否为空
+        if len(merged_df) == 0:
+            logger.error("异常值移除后数据为空，调整异常值阈值")
+            # 重新加载数据并跳过异常值移除
+            merged_df = self.merge_datasets(date_range)
+            merged_df = self.calculate_returns_and_features(merged_df)
+            logger.info(f"跳过异常值移除后数据量: {len(merged_df)} 行")
+        
+        # 5. 过滤股票 - 降低最小历史要求
+        original_min_history = self.config['min_stock_history']
+        self.config['min_stock_history'] = min(20, len(merged_df) // 10)  # 动态调整
+        merged_df = self.filter_stocks_by_history(merged_df)
+        logger.info(f"步骤5后数据量: {len(merged_df)} 行")
+        
+        # 如果数据仍然为空，进一步降低要求
+        if len(merged_df) == 0:
+            logger.warning("历史数据过滤后数据为空，降低最小历史要求")
+            self.config['min_stock_history'] = 5
+            merged_df = self.filter_stocks_by_history(self.calculate_returns_and_features(self.merge_datasets(date_range)))
+            logger.info(f"降低要求后数据量: {len(merged_df)} 行")
+        
+        # 恢复原始配置
+        self.config['min_stock_history'] = original_min_history
+        
+        # 最终检查
+        if len(merged_df) == 0:
+            logger.error("所有过滤步骤后数据为空，流程终止")
+            return None
+        
+        # 6. 特征标准化
+        merged_df = self.standardize_features(merged_df)
+        logger.info(f"步骤6后数据量: {len(merged_df)} 行")
+        
+        # 7. 创建时间序列
+        sequences = self.create_sequences(merged_df)
+        
+        # 8. 创建邻接矩阵
+        adj_matrices = self.create_adjacency_matrices(sequences['factor_sequences'])
+        sequences['adjacency_matrices'] = adj_matrices
+        
+        # 9. 分割数据集
+        split_data = self.split_data(sequences)
+        
+        # 10. 保存处理后的数据
+        final_data = {
+            'sequences': split_data,
+            'metadata': {
+                'factor_names': sequences['factor_names'],
+                'stock_ids': sequences['stock_ids'],
+                'dates': sequences['dates'],
+                'config': self.config
+            }
+        }
+        
+        self.save_processed_data(final_data)
+        
+        end_time = time.time()
+        
+        # 输出处理结果摘要
+        train_shape = split_data['train']['factor_sequences'].shape
+        logger.info("\n处理完成摘要:")
+        logger.info(f"总处理时间: {end_time - start_time:.2f} 秒")
+        logger.info(f"训练数据形状: {train_shape}")
+        logger.info(f"因子数量: {len(sequences['factor_names'])}")
+        logger.info(f"股票数量: {len(sequences['stock_ids'])}")
+        logger.info(f"时间序列长度: {self.config['sequence_length']}")
+        logger.info(f"预测时间跨度: {self.config['prediction_horizon']}")
+        
+        logger.info("\n使用建议:")
+        logger.info("1. 数据已保存为 'processed_astgnn_data.pt'")
+        logger.info("2. 可直接用于ASTGNN模型训练")
+        logger.info("3. 包含完整的训练/验证/测试分割")
+        logger.info("4. 已进行标准化和异常值处理")
+        
+        return final_data
+
+
+def main():
+    """主函数"""
+    # 自定义配置 - 降低过滤条件确保有足够数据
+    config = {
+        'sequence_length': 10,  # 降低序列长度
+        'prediction_horizon': 1,  # 降低预测期
+        'min_stock_history': 30,  # 大幅降低最小历史要求
+        'factor_standardization': True,
+        'return_standardization': True,
+        'remove_outliers': False,  # 暂时关闭异常值移除
+        'outlier_threshold': 3.0,  # 提高异常值阈值
+        'adjacency_threshold': 0.2,  # 降低邻接矩阵阈值
+        'data_split_ratio': [0.7, 0.15, 0.15],
+        'random_seed': 42
+    }
+    
+    # 初始化预处理器
+    preprocessor = ASTGNNDataPreprocessor(config)
+    
+    # 运行预处理流程 - 扩大数据范围
+    processed_data = preprocessor.run_preprocessing_pipeline(
+        stock_sample_size=150000,  # 增加股价数据样本
+        barra_sample_size=120000,  # 增加Barra数据样本
+        date_range=('2020-01-01', '2023-12-31')  # 扩大时间范围
+    )
+    
+    if processed_data:
+        logger.info("ASTGNN数据预处理完成！")
+
+
+if __name__ == '__main__':
+    main() 

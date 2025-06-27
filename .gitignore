@@ -24,6 +24,8 @@ wheels/
 *.pt
 *.pth
 factor_panel_data.csv
+stock_price_vol_d.txt
+barra_Exposure(2).
 
 # 图片输出（可选择性上传）
 *.png
