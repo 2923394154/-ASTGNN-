@@ -22,6 +22,7 @@ wheels/
 
 # 数据文件（太大不适合上传）
 *.pt
+!processed_astgnn_data.pt  # 例外：允许上传预处理后的训练数据
 *.pth
 factor_panel_data.csv
 stock_price_vol_d.txt
