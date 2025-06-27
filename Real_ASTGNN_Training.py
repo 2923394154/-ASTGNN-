@@ -277,15 +277,20 @@ class RealASTGNNTrainer:
             # 我们用这些因子来预测收益率
             
             # 处理目标张量维度
-            if target_returns.dim() == 3:
-                target_returns = target_returns.squeeze(1)  # [batch, stocks]
+            # target_returns 形状: [batch_size, prediction_horizon, num_stocks]
+            # 我们需要将其转换为多期收益率列表
             
             # 使用ASTGNN_Loss模块中的损失函数
             # 将每个批次的因子矩阵作为F [num_stocks, num_factors]
             batch_loss = 0.0
             for b in range(min(batch_size, 5)):  # 限制批次数以避免内存问题
                 F = predictions[b]  # [num_stocks, num_factors] 保持原来的维度
-                future_returns_list = [target_returns[b]]  # 当前批次的收益率
+                
+                # 构建未来多期收益率列表，每个元素形状为 [num_stocks]
+                future_returns_list = []
+                for t in range(target_returns.shape[1]):  # 遍历预测时间步
+                    future_returns_list.append(target_returns[b, t])  # [num_stocks]
+                
                 batch_loss += self.criterion(F, future_returns_list)
             
             total_batch_loss = batch_loss / min(batch_size, 5)
@@ -304,7 +309,9 @@ class RealASTGNNTrainer:
             
             # 计算R²分数（使用因子的第一个维度作为代理）
             with torch.no_grad():
-                r2_score = self.calculate_r2_score(predictions[:, :, 0], target_returns)
+                # 使用第一个时间步的收益率进行R²计算
+                target_for_r2 = target_returns[:, 0, :]  # [batch_size, num_stocks]
+                r2_score = self.calculate_r2_score(predictions[:, :, 0], target_for_r2)
             
             total_loss += total_batch_loss.item()
             total_r2 += r2_score
@@ -336,20 +343,26 @@ class RealASTGNNTrainer:
                 predictions, risk_factors, attention_weights, intermediate_outputs = self.model(factor_sequences, adj_matrix)
                 
                 # 处理目标张量维度
-                if target_returns.dim() == 3:
-                    target_returns = target_returns.squeeze(1)  # [batch, stocks]
+                # target_returns 形状: [batch_size, prediction_horizon, num_stocks]
                 
                 # 计算损失（类似训练时的处理）
                 batch_loss = 0.0
                 for b in range(min(batch_size, 5)):
                     F = predictions[b]  # [num_stocks, num_factors] 保持原来的维度
-                    future_returns_list = [target_returns[b]]
+                    
+                    # 构建未来多期收益率列表，每个元素形状为 [num_stocks]
+                    future_returns_list = []
+                    for t in range(target_returns.shape[1]):  # 遍历预测时间步
+                        future_returns_list.append(target_returns[b, t])  # [num_stocks]
+                    
                     batch_loss += self.criterion(F, future_returns_list)
                 
                 total_batch_loss = batch_loss / min(batch_size, 5)
                 
                 # 计算R²分数（使用第一个因子）
-                r2_score = self.calculate_r2_score(predictions[:, :, 0], target_returns)
+                # 使用第一个时间步的收益率进行R²计算
+                target_for_r2 = target_returns[:, 0, :]  # [batch_size, num_stocks]
+                r2_score = self.calculate_r2_score(predictions[:, :, 0], target_for_r2)
                 
                 total_loss += total_batch_loss.item()
                 total_r2 += r2_score
@@ -361,9 +374,9 @@ class RealASTGNNTrainer:
     
     def calculate_r2_score(self, predictions: torch.Tensor, targets: torch.Tensor) -> float:
         """计算R²分数"""
-        # 展平张量
-        pred_flat = predictions.view(-1)
-        target_flat = targets.view(-1)
+        # 展平张量 - 使用 reshape 避免连续性问题
+        pred_flat = predictions.reshape(-1)
+        target_flat = targets.reshape(-1)
         
         # 移除NaN值
         mask = ~(torch.isnan(pred_flat) | torch.isnan(target_flat))
@@ -499,9 +512,10 @@ class RealASTGNNTrainer:
         factors = torch.cat(all_factors, dim=0)  # [total_batches, stocks, num_factors]
         targets = torch.cat(all_targets, dim=0)
         
-        # 修复目标张量形状不匹配问题
-        if targets.dim() == 3 and targets.shape[1] == 1:
-            targets = targets.squeeze(1)  # 移除多余维度 [batch, 1, stocks] -> [batch, stocks]
+        # 处理目标张量形状：[batch, prediction_horizon, stocks] -> [batch, stocks]
+        # 我们使用第一个预测期的收益率进行IC分析
+        if targets.dim() == 3:
+            targets = targets[:, 0, :]  # 选择第一个预测期 [batch, stocks]
         
         # 打印调试信息
         logger.info(f"因子形状: {factors.shape}")  # [time, stocks, factors]

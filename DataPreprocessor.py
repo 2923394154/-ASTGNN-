@@ -29,9 +29,22 @@ plt.rcParams['axes.unicode_minus'] = False
 class ASTGNNDataPreprocessor:
     """ASTGNN数据预处理器"""
     
-    def __init__(self, config: Optional[Dict] = None):
+    def __init__(self, config: Optional[Dict] = None, use_gpu: Optional[bool] = None):
         """初始化预处理器"""
         self.config = config or self._get_default_config()
+        
+        # GPU加速配置
+        if use_gpu is None:
+            use_gpu = torch.cuda.is_available()
+        self.use_gpu = use_gpu and torch.cuda.is_available()
+        
+        if self.use_gpu:
+            self.device = torch.device('cuda')
+            torch.cuda.empty_cache()
+            logger.info(f"GPU加速已启用 - 设备: {torch.cuda.get_device_name()}")
+        else:
+            self.device = torch.device('cpu')
+            logger.info("使用CPU处理")
         
         # 文件路径
         self.stock_file = self.config.get('stock_file', 'stock_price_vol_d.txt')
@@ -47,12 +60,15 @@ class ASTGNNDataPreprocessor:
         self.factor_scaler = StandardScaler()
         self.return_scaler = RobustScaler()
         
+        # GPU批处理大小配置
+        self.gpu_batch_size = self.config.get('gpu_batch_size', 1000)
+        
         logger.info("数据预处理器初始化完成")
     
     def _get_default_config(self) -> Dict:
         """获取默认配置"""
         return {
-            'sequence_length': 20,
+            'sequence_length': 30,
             'prediction_horizon': 5,
             'min_stock_history': 60,
             'factor_standardization': True,
@@ -62,7 +78,12 @@ class ASTGNNDataPreprocessor:
             'min_correlation_threshold': 0.1,
             'adjacency_threshold': 0.3,
             'data_split_ratio': [0.7, 0.15, 0.15],  # train, val, test
-            'random_seed': 42
+            'random_seed': 42,
+            # GPU加速相关配置
+            'gpu_batch_size': 1000,
+            'use_gpu_for_correlation': True,
+            'use_gpu_for_technical_indicators': True,
+            'gpu_memory_fraction': 0.8
         }
     
     def load_stock_data(self, sample_size: Optional[int] = None, 
@@ -556,8 +577,8 @@ class ASTGNNDataPreprocessor:
             logger.error(f"保存失败: {str(e)}")
     
     def run_preprocessing_pipeline(self, 
-                                 stock_sample_size: int = 200000,
-                                 barra_sample_size: int = 100000,
+                                 stock_sample_size: int = 150000,
+                                 barra_sample_size: int = 120000,
                                  date_range: Tuple[str, str] = ('2020-01-01', '2023-12-31')) -> Optional[Dict]:
         """运行完整的预处理流程"""
         logger.info("启动ASTGNN数据预处理流程")
@@ -830,14 +851,283 @@ class ASTGNNDataPreprocessor:
         
         print("="*60)
 
+    def gpu_accelerated_calculate_returns_and_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """GPU加速版本的收益率和技术指标计算"""
+        logger.info("GPU加速计算收益率和技术指标")
+        
+        if not self.use_gpu or len(data) < 10000:
+            return self.calculate_returns_and_features(data)
+        
+        data = data.reset_index(drop=True)
+        data = data.sort_values(['StockID', 'date'])
+        
+        results = []
+        stock_groups = data.groupby('StockID')
+        
+        # 批处理股票
+        stock_list = list(stock_groups.groups.keys())
+        batch_size = min(self.gpu_batch_size // 10, len(stock_list))  # 调整批量大小
+        
+        for i in range(0, len(stock_list), batch_size):
+            batch_stocks = stock_list[i:i+batch_size]
+            
+            # 处理当前批次的股票
+            for stock_id in batch_stocks:
+                stock_data = stock_groups.get_group(stock_id).copy()
+                if len(stock_data) < 2:
+                    continue
+                
+                # 转换到GPU进行计算
+                stock_data_gpu = self._gpu_process_single_stock(stock_data)
+                results.append(stock_data_gpu)
+            
+            # 定期清理GPU内存
+            if i % (batch_size * 5) == 0:
+                torch.cuda.empty_cache()
+        
+        final_data = pd.concat(results, ignore_index=True) if results else data
+        logger.info("GPU加速收益率和技术指标计算完成")
+        return final_data
+
+    def _gpu_process_single_stock(self, stock_data: pd.DataFrame) -> pd.DataFrame:
+        """使用GPU处理单只股票的技术指标"""
+        # 提取价格和成交量数据到GPU
+        prices = torch.tensor(stock_data['close'].values, device=self.device, dtype=torch.float32)
+        volumes = torch.tensor(stock_data['vol'].values, device=self.device, dtype=torch.float32)
+        
+        # GPU计算各种收益率
+        stock_data['return_1d'] = self._gpu_pct_change(prices, 1).cpu().numpy()
+        stock_data['return_5d'] = self._gpu_pct_change(prices, 5).cpu().numpy()
+        stock_data['return_10d'] = self._gpu_pct_change(prices, 10).cpu().numpy()
+        stock_data['return_20d'] = self._gpu_pct_change(prices, 20).cpu().numpy()
+        
+        # 对数收益率
+        log_returns = torch.cat([
+            torch.tensor([0.0], device=self.device),
+            torch.log(prices[1:] / prices[:-1])
+        ])
+        stock_data['log_return'] = log_returns.cpu().numpy()
+        
+        # 波动率指标
+        stock_data['volatility_5d'] = self._gpu_rolling_std(log_returns, 5).cpu().numpy()
+        stock_data['volatility_20d'] = self._gpu_rolling_std(log_returns, 20).cpu().numpy()
+        
+        # 移动平均线
+        ma_5 = self._gpu_rolling_mean(prices, 5)
+        ma_20 = self._gpu_rolling_mean(prices, 20)
+        vol_ma_5 = self._gpu_rolling_mean(volumes, 5)
+        
+        stock_data['price_ma_5'] = ma_5.cpu().numpy()
+        stock_data['price_ma_20'] = ma_20.cpu().numpy()
+        stock_data['price_ratio_ma5'] = (prices / ma_5).cpu().numpy()
+        stock_data['price_ratio_ma20'] = (prices / ma_20).cpu().numpy()
+        stock_data['volume_ma_5'] = vol_ma_5.cpu().numpy()
+        stock_data['volume_ratio'] = (volumes / vol_ma_5).cpu().numpy()
+        
+        # 动量指标
+        stock_data['momentum_5d'] = self._gpu_momentum(prices, 5).cpu().numpy()
+        stock_data['momentum_20d'] = self._gpu_momentum(prices, 20).cpu().numpy()
+        
+        return stock_data
+
+    def _gpu_pct_change(self, prices: torch.Tensor, periods: int) -> torch.Tensor:
+        """GPU版本的百分比变化计算"""
+        if len(prices) <= periods:
+            return torch.zeros_like(prices)
+        
+        shifted = torch.roll(prices, periods)
+        shifted[:periods] = prices[0]  # 填充前几期
+        returns = (prices - shifted) / shifted
+        returns[:periods] = 0.0  # 前几期设为0
+        return returns
+
+    def _gpu_rolling_mean(self, data: torch.Tensor, window: int) -> torch.Tensor:
+        """GPU版本的滚动平均计算"""
+        if len(data) < window:
+            return torch.full_like(data, data.mean())
+        
+        # 使用1D卷积实现滚动平均
+        data_expanded = data.unsqueeze(0).unsqueeze(0)  # [1, 1, length]
+        kernel = torch.ones(1, 1, window, device=self.device) / window
+        
+        # 左填充以保持长度
+        padded = torch.nn.functional.pad(data_expanded, (window-1, 0))
+        result = torch.nn.functional.conv1d(padded, kernel)
+        
+        return result.squeeze()
+
+    def _gpu_rolling_std(self, data: torch.Tensor, window: int) -> torch.Tensor:
+        """GPU版本的滚动标准差计算"""
+        if len(data) < window:
+            return torch.full_like(data, data.std())
+        
+        # 计算滚动均值
+        mean_rolled = self._gpu_rolling_mean(data, window)
+        
+        # 计算平方的滚动平均
+        data_squared = data ** 2
+        mean_squared = self._gpu_rolling_mean(data_squared, window)
+        
+        # 方差 = E[X²] - E[X]²
+        variance = mean_squared - mean_rolled ** 2
+        variance = torch.clamp(variance, min=0)  # 确保非负
+        
+        return torch.sqrt(variance)
+
+    def _gpu_momentum(self, prices: torch.Tensor, periods: int) -> torch.Tensor:
+        """GPU版本的动量计算"""
+        if len(prices) <= periods:
+            return torch.zeros_like(prices)
+        
+        shifted = torch.roll(prices, periods)
+        shifted[:periods] = prices[0]
+        momentum = (prices / shifted) - 1
+        momentum[:periods] = 0.0
+        return momentum
+
+    def gpu_accelerated_create_adjacency_matrices(self, factor_sequences: torch.Tensor) -> torch.Tensor:
+        """GPU加速版本的邻接矩阵创建"""
+        logger.info("GPU加速创建邻接矩阵")
+        logger.info(f"factor_sequences形状: {factor_sequences.shape}")
+        
+        if not self.use_gpu or not self.config.get('use_gpu_for_correlation', True):
+            return self.create_adjacency_matrices(factor_sequences)
+        
+        # 检查维度
+        if len(factor_sequences.shape) == 4:
+            num_sequences, seq_len, num_stocks, num_factors = factor_sequences.shape
+        else:
+            logger.error(f"不支持的factor_sequences维度: {factor_sequences.shape}")
+            return torch.zeros(1, 1, 1, 1)
+        
+        # 移动到GPU
+        factor_sequences_gpu = factor_sequences.to(self.device)
+        adj_matrices = torch.zeros(num_sequences, seq_len, num_stocks, num_stocks, device=self.device)
+        threshold = self.config['adjacency_threshold']
+        
+        # 批量处理以节省GPU内存
+        batch_size = min(50, num_sequences)
+        
+        for batch_start in range(0, num_sequences, batch_size):
+            batch_end = min(batch_start + batch_size, num_sequences)
+            
+            for seq_idx in range(batch_start, batch_end):
+                for t in range(seq_len):
+                    factors_t = factor_sequences_gpu[seq_idx, t]  # [stocks, factors]
+                    
+                    if not torch.isnan(factors_t).all() and factors_t.shape[0] > 1:
+                        try:
+                            # 标准化特征
+                            factors_norm = torch.nn.functional.normalize(factors_t, dim=1, eps=1e-8)
+                            
+                            # 计算相关矩阵 (GPU并行)
+                            corr_matrix = torch.mm(factors_norm, factors_norm.t())
+                            corr_matrix = torch.nan_to_num(corr_matrix, nan=0.0)
+                            
+                            # 转换为邻接矩阵
+                            adj_matrix = torch.abs(corr_matrix)
+                            adj_matrix[adj_matrix < threshold] = 0
+                            adj_matrix.fill_diagonal_(1.0)
+                            
+                            adj_matrices[seq_idx, t] = adj_matrix
+                        except Exception as e:
+                            logger.warning(f"GPU相关矩阵计算失败 seq_idx={seq_idx}, t={t}: {str(e)}")
+                            adj_matrices[seq_idx, t] = torch.eye(num_stocks, device=self.device)
+                    else:
+                        adj_matrices[seq_idx, t] = torch.eye(num_stocks, device=self.device)
+            
+            # 定期清理GPU内存
+            if batch_start % (batch_size * 5) == 0:
+                torch.cuda.empty_cache()
+        
+        # 移回CPU
+        adj_matrices_cpu = adj_matrices.cpu()
+        torch.cuda.empty_cache()
+        
+        logger.info(f"GPU邻接矩阵创建完成: {adj_matrices_cpu.shape}")
+        return adj_matrices_cpu
+
+    def get_gpu_memory_usage(self) -> Dict[str, float]:
+        """获取GPU内存使用情况"""
+        if not self.use_gpu:
+            return {"message": "GPU未启用"}
+        
+        memory_info = {
+            'gpu_allocated_gb': torch.cuda.memory_allocated() / 1e9,
+            'gpu_cached_gb': torch.cuda.memory_reserved() / 1e9,
+            'gpu_max_allocated_gb': torch.cuda.max_memory_allocated() / 1e9,
+            'gpu_total_gb': torch.cuda.get_device_properties(0).total_memory / 1e9
+        }
+        
+        return memory_info
+
+    def optimize_gpu_memory(self):
+        """优化GPU内存使用"""
+        if self.use_gpu:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.info("GPU内存优化完成")
+
+    def set_gpu_batch_size(self, batch_size: int):
+        """动态调整GPU批处理大小"""
+        self.gpu_batch_size = batch_size
+        logger.info(f"GPU批处理大小已设置为: {batch_size}")
+
+    def benchmark_gpu_performance(self, test_data_size: int = 50000) -> Dict[str, float]:
+        """GPU性能基准测试"""
+        logger.info(f"开始GPU性能基准测试 - 数据规模: {test_data_size}")
+        
+        # 生成测试数据
+        num_stocks = 200
+        num_periods = test_data_size // num_stocks
+        
+        test_data = pd.DataFrame({
+            'StockID': np.repeat(range(num_stocks), num_periods),
+            'date': pd.date_range('2020-01-01', periods=num_periods).repeat(num_stocks),
+            'close': np.random.randn(test_data_size) * 100 + 1000,
+            'vol': np.random.randint(1000, 100000, test_data_size)
+        })
+        
+        results = {}
+        
+        # 测试CPU性能
+        original_use_gpu = self.use_gpu
+        self.use_gpu = False
+        
+        start_time = time.time()
+        cpu_result = self.calculate_returns_and_features(test_data.copy())
+        results['cpu_time'] = time.time() - start_time
+        
+        # 测试GPU性能
+        if torch.cuda.is_available():
+            self.use_gpu = True
+            torch.cuda.reset_peak_memory_stats()
+            
+            start_time = time.time()
+            gpu_result = self.gpu_accelerated_calculate_returns_and_features(test_data.copy())
+            results['gpu_time'] = time.time() - start_time
+            
+            if results['gpu_time'] > 0:
+                results['speedup'] = results['cpu_time'] / results['gpu_time']
+            
+            # GPU内存使用情况
+            memory_info = self.get_gpu_memory_usage()
+            results.update(memory_info)
+        
+        # 恢复原始设置
+        self.use_gpu = original_use_gpu
+        
+        logger.info(f"性能测试完成: {results}")
+        return results
+
 
 def main():
     """主函数"""
     # 自定义配置 - 降低过滤条件确保有足够数据
     config = {
-        'sequence_length': 10,  # 降低序列长度
-        'prediction_horizon': 1,  # 降低预测期
-        'min_stock_history': 30,  # 大幅降低最小历史要求
+        'sequence_length': 30,  
+        'prediction_horizon': 5,  
+        'min_stock_history': 60,  
         'factor_standardization': True,
         'return_standardization': True,
         'remove_outliers': False,  # 暂时关闭异常值移除
@@ -852,8 +1142,8 @@ def main():
     
     # 运行预处理流程 - 扩大数据范围
     processed_data = preprocessor.run_preprocessing_pipeline(
-        stock_sample_size=150000,  # 增加股价数据样本
-        barra_sample_size=120000,  # 增加Barra数据样本
+        stock_sample_size=150000,
+        barra_sample_size=120000,
         date_range=('2020-01-01', '2023-12-31')  # 扩大时间范围
     )
     
