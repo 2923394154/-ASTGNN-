@@ -1160,37 +1160,54 @@ class ASTGNNDataPreprocessor:
 
 
 def main():
-    """主函数"""
-    # 针对专业回测优化的配置
+    """主函数 - 7年专业回测数据预处理"""
+    # 7年专业回测配置，对标业界表现
     config = {
-        'sequence_length': 15,  # 缩短序列长度以获得更多时间点
-        'prediction_horizon': 10,  # 未来10日收益率
-        'min_stock_history': 30,  # 降低最小历史要求
+        'sequence_length': 20,  
+        'prediction_horizon': 10,  
+        'min_stock_history': 252,  
         'factor_standardization': True,
         'return_standardization': True,
-        'remove_outliers': False,  # 关闭异常值移除
+        'remove_outliers': True,  
         'outlier_threshold': 5.0,  
-        'adjacency_threshold': 0.2,  
-        'data_split_ratio': [0.6, 0.2, 0.2],
+        'adjacency_threshold': 0.15,  
+        'data_split_ratio': [0.7, 0.15, 0.15],  # 长期数据训练优化
         'random_seed': 42,
-        # 专业回测配置
+        # 7年完整回测配置
+        'full_backtest_start_date': '2017-01-01',
+        'full_backtest_end_date': '2024-04-30',
+        'training_start_date': '2017-01-01',
+        'training_end_date': '2023-12-28',
         'backtest_start_date': '2023-12-29',
         'backtest_end_date': '2024-04-30',
-        'min_periods_for_backtest': 100
+        'min_periods_for_backtest': 1000,
+        'rebalance_frequency': 10,
+        'annual_periods': 252
     }
     
     # 初始化预处理器
     preprocessor = ASTGNNDataPreprocessor(config)
     
-    # 运行预处理流程 - 使用包含回测期间的完整时间范围
+    # 运行7年完整数据预处理流程
+    logger.info("=" * 80)
+    logger.info("开始7年专业回测数据预处理 (2017-2024)")
+    logger.info("=" * 80)
+    
     processed_data = preprocessor.run_preprocessing_pipeline(
-        stock_sample_size=200000,
-        barra_sample_size=180000,
-        date_range=('2023-01-01', '2024-06-30')  # 确保包含完整回测期间
+        stock_sample_size=500000,    # 增加样本量以覆盖7年数据
+        barra_sample_size=450000,
+        date_range=('2017-01-01', '2024-04-30')  # 7年完整时间范围
     )
     
     if processed_data:
-        logger.info("ASTGNN数据预处理完成！")
+        logger.info("✓ 7年专业回测数据预处理完成！")
+        logger.info(f"训练期间: 2017-01-01 至 2023-12-28")
+        logger.info(f"回测期间: 2023-12-29 至 2024-04-30")
+        logger.info(f"总序列数: {processed_data['sequences']['train']['factor_sequences'].shape[0]}")
+        logger.info(f"因子数量: {len(processed_data['metadata']['factor_names'])}")
+        logger.info(f"股票数量: {len(processed_data['metadata']['stock_ids'])}")
+    else:
+        logger.error("数据预处理失败！")
 
 
 if __name__ == '__main__':

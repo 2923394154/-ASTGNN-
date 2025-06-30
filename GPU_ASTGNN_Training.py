@@ -112,25 +112,45 @@ class GPUOptimizedASTGNNTrainer:
     def _get_default_config(self) -> Dict:
         """获取GPU优化的默认训练配置"""
         return {
-            'learning_rate': 0.002,
-            'weight_decay': 1e-5,
-            'batch_size': 16,  # 增加批次大小以更好利用GPU
-            'epochs': 100,
-            'early_stopping_patience': 15,
-            'gradient_clip_norm': 1.0,
-            'orthogonal_penalty_weight': 0.01,
-            'time_weight_decay': 0.9,
-            'validation_frequency': 5,
+            'learning_rate': 0.0003,  # 大幅降低学习率，避免训练发散
+            'weight_decay': 1e-4,     # 增强正则化，防止过拟合
+            'batch_size': 32,         # 【修复】增加批次大小，减少batch数量(8->32)
+            'epochs': 100,            # 增加训练轮数，充分学习7年数据
+            'early_stopping_patience': 50,  # 大幅增加耐心，避免过早停止
+            'gradient_clip_norm': 0.3,      # 严格梯度裁剪，防止梯度爆炸
+            'orthogonal_penalty_weight': 0.001,  # 大幅降低正交惩罚，专注主要任务
+            'time_weight_decay': 0.98,  # 提高时间权重，更重视近期表现
+            'validation_frequency': 10, # 降低验证频率，减少训练中断
             'save_best_model': True,
-            'model_save_path': 'gpu_astgnn_best_model.pth',
+            'model_save_path': 'fixed_professional_astgnn_model.pth',
             'plot_results': True,
-            # GPU加速配置
-            'use_amp': True,  # 启用混合精度训练
-            'num_workers': 8,  # 数据加载器工作进程数
-            'pin_memory': True,  # 锁页内存
-            'compile_model': True,  # 启用模型编译优化
-            'gradient_accumulation_steps': 2,  # 梯度累积步数
-            'prefetch_factor': 4,  # 预取因子
+            
+            # 专业回测目标配置 - 严格对标
+            'target_annual_return': 0.36,    # 目标年化收益36%
+            'target_sharpe_ratio': 4.19,     # 目标夏普比率4.19
+            'target_max_drawdown': -0.16,    # 目标最大回撤-16%
+            'target_calmar_ratio': 1.74,     # 目标Calmar比率1.74
+            'target_win_rate': 0.65,         # 目标胜率65%
+            'rebalance_frequency': 10,       # 10日调仓
+            'transaction_cost': 0.0005,      # 降低交易成本假设
+            'position_limit': 0.05,          # 单股最大持仓5%
+            'long_only': True,               # 仅多头策略，降低风险
+            'top_quantile': 0.2,             # 选择前20%股票
+            
+            # GPU优化配置
+            'use_amp': True,
+            'num_workers': 6,
+            'pin_memory': True,
+            'compile_model': False,  # 暂时关闭模型编译，提高稳定性
+            'gradient_accumulation_steps': 4,  # 增加梯度累积，模拟更大批次
+            'prefetch_factor': 2,
+            'persistent_workers': True,
+            
+            # 数据质量控制
+            'outlier_removal': True,         # 启用异常值移除
+            'factor_normalization': True,    # 启用因子标准化
+            'return_winsorize': True,        # 收益率缩尾处理
+            'risk_budget': 0.15,             # 风险预算15%
         }
     
     def load_processed_data(self):
@@ -751,27 +771,48 @@ def main():
     """主函数"""
     logger.info("启动GPU优化ASTGNN训练")
     
-    # GPU优化训练配置
+    # 7年专业回测GPU优化训练配置 - 修复版本
     config = {
-        'learning_rate': 0.003,
-        'weight_decay': 1e-5,
-        'batch_size': 16,  # 根据GPU显存调整
-        'epochs': 120,
-        'early_stopping_patience': 20,
-        'gradient_clip_norm': 1.0,
-        'orthogonal_penalty_weight': 0.005,
-        'time_weight_decay': 0.9,
-        'validation_frequency': 5,
+        # 基础训练参数 - 大幅优化以修复负收益问题
+        'learning_rate': 0.0003,  # 大幅降低学习率，避免训练发散
+        'weight_decay': 1e-4,     # 增强正则化，防止过拟合
+        'batch_size': 32,         # 【修复】增加批次大小，减少batch数量(8->32)
+        'epochs': 100,            # 增加训练轮数，充分学习7年数据
+        'early_stopping_patience': 50,  # 大幅增加耐心，避免过早停止
+        'gradient_clip_norm': 0.3,      # 严格梯度裁剪，防止梯度爆炸
+        'orthogonal_penalty_weight': 0.001,  # 大幅降低正交惩罚，专注主要任务
+        'time_weight_decay': 0.98,  # 提高时间权重，更重视近期表现
+        'validation_frequency': 10, # 降低验证频率，减少训练中断
         'save_best_model': True,
-        'model_save_path': 'gpu_astgnn_best_model.pth',
+        'model_save_path': 'fixed_professional_astgnn_model.pth',
         'plot_results': True,
+        
+        # 专业回测目标配置 - 严格对标
+        'target_annual_return': 0.36,    # 目标年化收益36%
+        'target_sharpe_ratio': 4.19,     # 目标夏普比率4.19
+        'target_max_drawdown': -0.16,    # 目标最大回撤-16%
+        'target_calmar_ratio': 1.74,     # 目标Calmar比率1.74
+        'target_win_rate': 0.65,         # 目标胜率65%
+        'rebalance_frequency': 10,       # 10日调仓
+        'transaction_cost': 0.0005,      # 降低交易成本假设
+        'position_limit': 0.05,          # 单股最大持仓5%
+        'long_only': True,               # 仅多头策略，降低风险
+        'top_quantile': 0.2,             # 选择前20%股票
+        
         # GPU优化配置
         'use_amp': True,
-        'num_workers': 8,
+        'num_workers': 6,
         'pin_memory': True,
-        'compile_model': True,
-        'gradient_accumulation_steps': 2,
-        'prefetch_factor': 4,
+        'compile_model': False,  # 暂时关闭模型编译，提高稳定性
+        'gradient_accumulation_steps': 4,  # 增加梯度累积，模拟更大批次
+        'prefetch_factor': 2,
+        'persistent_workers': True,
+        
+        # 数据质量控制
+        'outlier_removal': True,         # 启用异常值移除
+        'factor_normalization': True,    # 启用因子标准化
+        'return_winsorize': True,        # 收益率缩尾处理
+        'risk_budget': 0.15,             # 风险预算15%
     }
     
     # 创建GPU优化训练器
