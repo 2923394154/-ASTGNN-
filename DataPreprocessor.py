@@ -66,24 +66,34 @@ class ASTGNNDataPreprocessor:
         logger.info("数据预处理器初始化完成")
     
     def _get_default_config(self) -> Dict:
-        """获取默认配置"""
+        """获取默认配置 - 针对7年专业回测优化"""
         return {
-            'sequence_length': 30,
-            'prediction_horizon': 5,
-            'min_stock_history': 60,
+            'sequence_length': 20,  # 适度增加序列长度以捕获更多模式
+            'prediction_horizon': 10,  # 未来10日收益率预测
+            'min_stock_history': 252,  # 最少1年交易日历史数据
             'factor_standardization': True,
             'return_standardization': True,
-            'remove_outliers': True,
-            'outlier_threshold': 3.0,
-            'min_correlation_threshold': 0.1,
-            'adjacency_threshold': 0.3,
-            'data_split_ratio': [0.7, 0.15, 0.15],  # train, val, test
+            'remove_outliers': True,  # 启用异常值移除以提高回测质量
+            'outlier_threshold': 5.0,
+            'min_correlation_threshold': 0.02,
+            'adjacency_threshold': 0.15,
+            'data_split_ratio': [0.7, 0.15, 0.15],  # 增加训练集比例用于长期数据
             'random_seed': 42,
+            # 7年专业回测相关配置
+            'full_backtest_start_date': '2017-01-01',  # 7年回测起始日期
+            'full_backtest_end_date': '2024-04-30',    # 回测结束日期
+            'training_start_date': '2017-01-01',       # 训练开始日期
+            'training_end_date': '2023-12-28',         # 训练结束日期（回测前一天）
+            'backtest_start_date': '2023-12-29',       # 实际回测开始
+            'backtest_end_date': '2024-04-30',         # 实际回测结束
+            'min_periods_for_backtest': 1000,          # 7年数据需要更多时间点
+            'rebalance_frequency': 10,                 # 每10个交易日调仓
+            'annual_periods': 252,                     # 年化期数
             # GPU加速相关配置
-            'gpu_batch_size': 1000,
+            'gpu_batch_size': 2000,
             'use_gpu_for_correlation': True,
             'use_gpu_for_technical_indicators': True,
-            'gpu_memory_fraction': 0.8
+            'gpu_memory_fraction': 0.9
         }
     
     def load_stock_data(self, sample_size: Optional[int] = None, 
@@ -111,35 +121,51 @@ class ASTGNNDataPreprocessor:
                 df = df[(df['date'] >= start_date) & (df['date'] <= end_date)]
                 logger.info(f"按目标日期过滤后: {df.shape}")
             
-            # 智能采样：按股票和时间均匀采样，而非完全随机
+            # 专业回测优化: 优先保证时间完整性，仅在股票维度进行采样
             if sample_size and len(df) > sample_size:
-                # 先按股票分组，确保每只股票都有代表性数据
-                stock_groups = df.groupby('StockID')
-                stocks_list = list(stock_groups.groups.keys())
+                logger.info(f"数据量较大({len(df):,}行)，进行优化采样以保证时间完整性")
                 
-                # 计算每只股票应该采样的行数
-                max_stocks = min(len(stocks_list), sample_size // 100)  # 每只股票至少100行
-                selected_stocks = stocks_list[:max_stocks] if len(stocks_list) > max_stocks else stocks_list
+                # 如果有目标时间范围，优先保证该时间范围的完整性
+                if target_date_range:
+                    start_target, end_target = target_date_range
+                    target_period_data = df[
+                        (df['date'] >= start_target) & 
+                        (df['date'] <= end_target)
+                    ]
+                    logger.info(f"目标时间范围({start_target}至{end_target})数据量: {len(target_period_data):,}行")
                 
-                sampled_dfs = []
-                remaining_sample = sample_size
-                
-                for i, stock in enumerate(selected_stocks):
-                    stock_data = stock_groups.get_group(stock)
-                    # 为每只股票分配样本数
-                    stock_sample_size = min(len(stock_data), remaining_sample // (len(selected_stocks) - i))
+                    # 如果目标时间范围的数据小于sample_size，直接使用
+                    if len(target_period_data) <= sample_size:
+                        df = target_period_data
+                        logger.info(f"使用目标时间范围完整数据: {len(df):,}行")
+                    else:
+                        # 目标时间范围数据过多，在股票维度采样但保证时间完整性
+                        all_dates = sorted(target_period_data['date'].unique())
+                        all_stocks = list(target_period_data['StockID'].unique())
+                        
+                        # 计算可以保留多少只股票
+                        avg_points_per_stock = len(target_period_data) / len(all_stocks)
+                        max_stocks = min(len(all_stocks), int(sample_size / avg_points_per_stock))
+                        
+                        # 随机选择股票但保证每个时间点都有代表性
+                        import random
+                        random.seed(42)
+                        selected_stocks = random.sample(all_stocks, max_stocks)
+                        
+                        df = target_period_data[target_period_data['StockID'].isin(selected_stocks)]
+                        logger.info(f"保证时间完整性的股票采样: {len(df):,}行, {len(selected_stocks)}只股票")
+                else:
+                    # 没有目标时间范围，使用传统的均匀采样但优化为时间优先
+                    logger.info("没有目标时间范围，使用时间优先的均匀采样")
+                    all_stocks = list(df['StockID'].unique())
+                    avg_points_per_stock = len(df) / len(all_stocks)
+                    max_stocks = min(len(all_stocks), int(sample_size / avg_points_per_stock))
                     
-                    if stock_sample_size > 0:
-                        # 按时间顺序采样，保持连续性
-                        if len(stock_data) > stock_sample_size:
-                            # 从最近的数据开始采样
-                            stock_data = stock_data.sort_values('date').tail(stock_sample_size)
-                        sampled_dfs.append(stock_data)
-                        remaining_sample -= len(stock_data)
-                
-                df = pd.concat(sampled_dfs, ignore_index=True)
-                df = df.sort_values(['date', 'StockID'])
-                logger.info(f"智能采样到 {len(df)} 行，覆盖 {df['StockID'].nunique()} 只股票")
+                    import random
+                    random.seed(42)
+                    selected_stocks = random.sample(all_stocks, max_stocks)
+                    df = df[df['StockID'].isin(selected_stocks)]
+                    logger.info(f"时间优先采样: {len(df):,}行, {len(selected_stocks)}只股票")
             
             # 基本统计信息
             date_range = (df['date'].min(), df['date'].max())
@@ -186,36 +212,48 @@ class ASTGNNDataPreprocessor:
                 df = df[(df['date'] >= start_date) & (df['date'] <= end_date)]
                 logger.info(f"按目标日期过滤后: {df.shape}")
             
-            # 智能采样：与股价数据采用相同的逻辑
+            # 专业回测优化: 优先保证时间完整性，仅在股票维度进行采样
             if sample_size and len(df) > sample_size:
-                # 按股票分组采样
-                stock_groups = df.groupby('StockID')
-                stocks_list = list(stock_groups.groups.keys())
+                logger.info(f"Barra数据量较大({len(df):,}行)，进行优化采样以保证时间完整性")
                 
-                # 如果有目标股票，优先选择这些股票
-                if target_stocks:
-                    stocks_list = [s for s in target_stocks if s in stocks_list]
-                
-                max_stocks = min(len(stocks_list), sample_size // 50)  # 每只股票至少50行
-                selected_stocks = stocks_list[:max_stocks] if len(stocks_list) > max_stocks else stocks_list
-                
-                sampled_dfs = []
-                remaining_sample = sample_size
-                
-                for i, stock in enumerate(selected_stocks):
-                    stock_data = stock_groups.get_group(stock)
-                    stock_sample_size = min(len(stock_data), remaining_sample // (len(selected_stocks) - i))
+                # 如果有目标时间范围，优先保证该时间范围的完整性
+                if target_date_range:
+                    start_target, end_target = target_date_range
+                    target_period_data = df[
+                        (df['date'] >= start_target) & 
+                        (df['date'] <= end_target)
+                    ]
+                    logger.info(f"Barra目标时间范围({start_target}至{end_target})数据量: {len(target_period_data):,}行")
                     
-                    if stock_sample_size > 0:
-                        # 按时间顺序采样，保持连续性
-                        if len(stock_data) > stock_sample_size:
-                            stock_data = stock_data.sort_values('date').tail(stock_sample_size)
-                        sampled_dfs.append(stock_data)
-                        remaining_sample -= len(stock_data)
-                
-                df = pd.concat(sampled_dfs, ignore_index=True)
-                df = df.sort_values(['date', 'StockID'])
-                logger.info(f"智能采样到 {len(df)} 行，覆盖 {df['StockID'].nunique()} 只股票")
+                    # 如果目标时间范围的数据小于sample_size，直接使用
+                    if len(target_period_data) <= sample_size:
+                        df = target_period_data
+                        logger.info(f"使用Barra目标时间范围完整数据: {len(df):,}行")
+                    else:
+                        # 目标时间范围数据过多，在股票维度采样但保证时间完整性
+                        all_stocks = list(target_period_data['StockID'].unique())
+                        avg_points_per_stock = len(target_period_data) / len(all_stocks)
+                        max_stocks = min(len(all_stocks), int(sample_size / avg_points_per_stock))
+                        
+                        # 随机选择股票但保证每个时间点都有代表性
+                        import random
+                        random.seed(42)
+                        selected_stocks = random.sample(all_stocks, max_stocks)
+                        
+                        df = target_period_data[target_period_data['StockID'].isin(selected_stocks)]
+                        logger.info(f"Barra保证时间完整性的股票采样: {len(df):,}行, {len(selected_stocks)}只股票")
+                else:
+                    # 没有目标时间范围，使用时间优先的均匀采样
+                    logger.info("Barra没有目标时间范围，使用时间优先的均匀采样")
+                    all_stocks = list(df['StockID'].unique())
+                    avg_points_per_stock = len(df) / len(all_stocks)
+                    max_stocks = min(len(all_stocks), int(sample_size / avg_points_per_stock))
+                    
+                    import random
+                    random.seed(42)
+                    selected_stocks = random.sample(all_stocks, max_stocks)
+                    df = df[df['StockID'].isin(selected_stocks)]
+                    logger.info(f"Barra时间优先采样: {len(df):,}行, {len(selected_stocks)}只股票")
             
             # 基本统计信息
             date_range = (df['date'].min(), df['date'].max())
@@ -577,9 +615,9 @@ class ASTGNNDataPreprocessor:
             logger.error(f"保存失败: {str(e)}")
     
     def run_preprocessing_pipeline(self, 
-                                 stock_sample_size: int = 150000,
-                                 barra_sample_size: int = 120000,
-                                 date_range: Tuple[str, str] = ('2020-01-01', '2023-12-31')) -> Optional[Dict]:
+                                 stock_sample_size: int = 200000,
+                                 barra_sample_size: int = 180000,
+                                 date_range: Tuple[str, str] = ('2023-01-01', '2024-06-30')) -> Optional[Dict]:
         """运行完整的预处理流程"""
         logger.info("启动ASTGNN数据预处理流程")
         logger.info("=" * 80)
@@ -1123,28 +1161,32 @@ class ASTGNNDataPreprocessor:
 
 def main():
     """主函数"""
-    # 自定义配置 - 降低过滤条件确保有足够数据
+    # 针对专业回测优化的配置
     config = {
-        'sequence_length': 30,  
-        'prediction_horizon': 5,  
-        'min_stock_history': 60,  
+        'sequence_length': 15,  # 缩短序列长度以获得更多时间点
+        'prediction_horizon': 10,  # 未来10日收益率
+        'min_stock_history': 30,  # 降低最小历史要求
         'factor_standardization': True,
         'return_standardization': True,
-        'remove_outliers': False,  # 暂时关闭异常值移除
-        'outlier_threshold': 3.0,  # 提高异常值阈值
-        'adjacency_threshold': 0.2,  # 降低邻接矩阵阈值
-        'data_split_ratio': [0.7, 0.15, 0.15],
-        'random_seed': 42
+        'remove_outliers': False,  # 关闭异常值移除
+        'outlier_threshold': 5.0,  
+        'adjacency_threshold': 0.2,  
+        'data_split_ratio': [0.6, 0.2, 0.2],
+        'random_seed': 42,
+        # 专业回测配置
+        'backtest_start_date': '2023-12-29',
+        'backtest_end_date': '2024-04-30',
+        'min_periods_for_backtest': 100
     }
     
     # 初始化预处理器
     preprocessor = ASTGNNDataPreprocessor(config)
     
-    # 运行预处理流程 - 扩大数据范围
+    # 运行预处理流程 - 使用包含回测期间的完整时间范围
     processed_data = preprocessor.run_preprocessing_pipeline(
-        stock_sample_size=150000,
-        barra_sample_size=120000,
-        date_range=('2020-01-01', '2023-12-31')  # 扩大时间范围
+        stock_sample_size=200000,
+        barra_sample_size=180000,
+        date_range=('2023-01-01', '2024-06-30')  # 确保包含完整回测期间
     )
     
     if processed_data:

@@ -20,10 +20,15 @@ from typing import Dict, List, Tuple, Optional
 import os
 from matplotlib.font_manager import FontProperties
 
+# GPU加速相关导入
+from torch.cuda.amp import GradScaler, autocast
+import torch.backends.cudnn as cudnn
+
 # 导入ASTGNN相关模块
 from ASTGNN import ASTGNNFactorModel
 from ASTGNN_Loss import ASTGNNFactorLoss
 from FactorValidation import FactorValidationFramework
+from Enhanced_Factor_Analysis import ProfessionalBacktestAnalyzer
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -51,9 +56,23 @@ class RealASTGNNTrainer:
         self.data_file = data_file
         self.config = config or self._get_default_config()
         
+        # GPU加速配置
+        self._setup_gpu_acceleration()
+        
         # 设备配置
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.gpu_count = torch.cuda.device_count()
         logger.info(f"使用设备: {self.device}")
+        if torch.cuda.is_available():
+            logger.info(f"GPU数量: {self.gpu_count}")
+            logger.info(f"GPU名称: {torch.cuda.get_device_name()}")
+            logger.info(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        
+        # 混合精度训练
+        self.use_amp = self.config.get('use_amp', True) and torch.cuda.is_available()
+        self.scaler = GradScaler() if self.use_amp else None
+        if self.use_amp:
+            logger.info("启用混合精度训练 (AMP)")
         
         # 加载数据
         self.load_processed_data()
@@ -63,6 +82,7 @@ class RealASTGNNTrainer:
         self.optimizer = None
         self.criterion = None
         self.validator = None
+        self.professional_analyzer = None
         
         # 训练记录
         self.train_losses = []
@@ -72,12 +92,30 @@ class RealASTGNNTrainer:
         
         logger.info("真实数据ASTGNN训练器初始化完成")
     
+    def _setup_gpu_acceleration(self):
+        """配置GPU加速优化"""
+        if torch.cuda.is_available():
+            # 启用cuDNN自动调优
+            cudnn.benchmark = True
+            cudnn.deterministic = False  # 提高性能，降低可重复性
+            
+            # 预分配GPU内存
+            torch.cuda.empty_cache()
+            
+            # 设置CUDA异步
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            
+            logger.info("GPU加速优化配置完成")
+        else:
+            logger.warning("CUDA不可用，将使用CPU训练")
+    
     def _get_default_config(self) -> Dict:
         """获取默认训练配置"""
         return {
             'learning_rate': 0.001,
             'weight_decay': 1e-5,
-            'batch_size': 4,  # 较小批次以适应大数据
+            'batch_size': 8,  # 增加批次大小以更好利用GPU
             'epochs': 100,
             'early_stopping_patience': 15,
             'gradient_clip_norm': 1.0,
@@ -86,7 +124,13 @@ class RealASTGNNTrainer:
             'validation_frequency': 5,
             'save_best_model': True,
             'model_save_path': 'real_astgnn_best_model.pth',
-            'plot_results': True
+            'plot_results': True,
+            # GPU加速配置
+            'use_amp': True,  # 启用混合精度训练
+            'num_workers': 4,  # 数据加载器工作进程数
+            'pin_memory': True,  # 锁页内存
+            'compile_model': True,  # 启用模型编译优化
+            'gradient_accumulation_steps': 1,  # 梯度累积步数
         }
     
     def load_processed_data(self):
@@ -122,41 +166,84 @@ class RealASTGNNTrainer:
             raise
     
     def create_data_loaders(self) -> Tuple[DataLoader, DataLoader, DataLoader]:
-        """创建数据加载器"""
-        logger.info("创建数据加载器")
+        """创建数据加载器 - GPU优化版本"""
+        logger.info("创建GPU优化数据加载器")
         
-        # 训练数据
-        train_dataset = TensorDataset(
-            self.data['train']['factor_sequences'].to(self.device),
-            self.data['train']['target_sequences'].to(self.device)
-        )
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=self.config['batch_size'], 
-            shuffle=True
-        )
+        # GPU加速数据加载配置
+        dataloader_config = {
+            'batch_size': self.config['batch_size'],
+            'num_workers': self.config.get('num_workers', 4) if torch.cuda.is_available() else 0,
+            'pin_memory': self.config.get('pin_memory', True) and torch.cuda.is_available(),
+            'persistent_workers': True if torch.cuda.is_available() and self.config.get('num_workers', 4) > 0 else False,
+        }
         
-        # 验证数据
-        val_dataset = TensorDataset(
-            self.data['validation']['factor_sequences'].to(self.device),
-            self.data['validation']['target_sequences'].to(self.device)
-        )
-        val_loader = DataLoader(
-            val_dataset, 
-            batch_size=self.config['batch_size'], 
-            shuffle=False
-        )
+        logger.info(f"数据加载器配置: {dataloader_config}")
         
-        # 测试数据
-        test_dataset = TensorDataset(
-            self.data['test']['factor_sequences'].to(self.device),
-            self.data['test']['target_sequences'].to(self.device)
-        )
-        test_loader = DataLoader(
-            test_dataset, 
-            batch_size=self.config['batch_size'], 
-            shuffle=False
-        )
+        # 对于GPU训练，数据先保持在CPU，通过pin_memory异步传输
+        if torch.cuda.is_available():
+            # 训练数据
+            train_dataset = TensorDataset(
+                self.data['train']['factor_sequences'],  # 保持在CPU
+                self.data['train']['target_sequences']   # 保持在CPU
+            )
+            train_loader = DataLoader(
+                train_dataset, 
+                shuffle=True,
+                **dataloader_config
+            )
+            
+            # 验证数据
+            val_dataset = TensorDataset(
+                self.data['validation']['factor_sequences'],
+                self.data['validation']['target_sequences']
+            )
+            val_loader = DataLoader(
+                val_dataset, 
+                shuffle=False,
+                **dataloader_config
+            )
+            
+            # 测试数据
+            test_dataset = TensorDataset(
+                self.data['test']['factor_sequences'],
+                self.data['test']['target_sequences']
+            )
+            test_loader = DataLoader(
+                test_dataset, 
+                shuffle=False,
+                **dataloader_config
+            )
+        else:
+            # CPU训练模式（原有逻辑）
+            train_dataset = TensorDataset(
+                self.data['train']['factor_sequences'].to(self.device),
+                self.data['train']['target_sequences'].to(self.device)
+            )
+            train_loader = DataLoader(
+                train_dataset, 
+                batch_size=self.config['batch_size'], 
+                shuffle=True
+            )
+            
+            val_dataset = TensorDataset(
+                self.data['validation']['factor_sequences'].to(self.device),
+                self.data['validation']['target_sequences'].to(self.device)
+            )
+            val_loader = DataLoader(
+                val_dataset, 
+                batch_size=self.config['batch_size'], 
+                shuffle=False
+            )
+            
+            test_dataset = TensorDataset(
+                self.data['test']['factor_sequences'].to(self.device),
+                self.data['test']['target_sequences'].to(self.device)
+            )
+            test_loader = DataLoader(
+                test_dataset, 
+                batch_size=self.config['batch_size'], 
+                shuffle=False
+            )
         
         logger.info(f"数据加载器创建完成:")
         logger.info(f"  训练批次: {len(train_loader)}")
@@ -183,12 +270,25 @@ class RealASTGNNTrainer:
             'num_tgc_layers': 2,
             'tgc_modes': ['add', 'subtract'],
             'prediction_hidden_sizes': [128, 64],
-            'num_predictions': 8,  # 修改：输出8个风险因子而不是1个收益率
+            'num_predictions': 1,  # 修改：输出单个因子
             'dropout': 0.1
         }
         
         # 创建模型
         self.model = ASTGNNFactorModel(**model_config).to(self.device)
+        
+        # 模型编译优化 (PyTorch 2.0+)
+        if self.config.get('compile_model', False) and hasattr(torch, 'compile'):
+            try:
+                self.model = torch.compile(self.model, mode='default')
+                logger.info("模型编译优化启用")
+            except Exception as e:
+                logger.warning(f"模型编译失败，继续使用原始模型: {e}")
+        
+        # 多GPU支持
+        if self.gpu_count > 1:
+            self.model = nn.DataParallel(self.model)
+            logger.info(f"启用多GPU训练，GPU数量: {self.gpu_count}")
         
         # 改进权重初始化以增加预测方差
         self._initialize_model_weights()
@@ -197,7 +297,9 @@ class RealASTGNNTrainer:
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=self.config['learning_rate'],
-            weight_decay=self.config['weight_decay']
+            weight_decay=self.config['weight_decay'],
+            eps=1e-8,  # 提高数值稳定性
+            amsgrad=True  # 启用AMSGrad
         )
         
         # 学习率调度器
@@ -220,6 +322,13 @@ class RealASTGNNTrainer:
         
         # 因子验证器
         self.validator = FactorValidationFramework()
+        
+        # 专业回测分析器
+        self.professional_analyzer = ProfessionalBacktestAnalyzer(
+            start_date='20231229',
+            end_date='20240430',
+            factor_names=['ASTGNN_Factor']  # 单因子名称
+        )
         
         # 模型参数统计
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -258,68 +367,104 @@ class RealASTGNNTrainer:
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
     
+    def _compute_batch_loss(self, predictions, target_returns, batch_size):
+        """计算批次损失"""
+        batch_loss = 0.0
+        for b in range(min(batch_size, 5)):
+            F = predictions[b]  # [num_stocks, num_factors]
+            
+            # 构建未来多期收益率列表，每个元素形状为 [num_stocks]
+            future_returns_list = []
+            for t in range(target_returns.shape[1]):  # 遍历预测时间步
+                future_returns_list.append(target_returns[b, t])  # [num_stocks]
+            
+            batch_loss += self.criterion(F, future_returns_list)
+        
+        return batch_loss / min(batch_size, 5)
+    
     def train_epoch(self, train_loader: DataLoader, epoch: int) -> Tuple[float, float]:
-        """训练一个epoch"""
+        """训练一个epoch - GPU优化版本"""
         self.model.train()
         total_loss = 0.0
         total_r2 = 0.0
         num_batches = len(train_loader)
         
+        # 梯度累积配置
+        accumulation_steps = self.config.get('gradient_accumulation_steps', 1)
+        
         for batch_idx, (factor_sequences, target_returns) in enumerate(train_loader):
+            # 异步数据传输到GPU
+            factor_sequences = factor_sequences.to(self.device, non_blocking=True)
+            target_returns = target_returns.to(self.device, non_blocking=True)
+            
             # 创建邻接矩阵（简单的单位矩阵，实际应该基于因子相关性）
             batch_size = factor_sequences.shape[0]
-            adj_matrix = torch.eye(self.num_stocks).unsqueeze(0).repeat(batch_size, 1, 1).to(self.device)
+            adj_matrix = torch.eye(self.num_stocks, device=self.device).unsqueeze(0).repeat(batch_size, 1, 1)
             
-            # 前向传播
-            predictions, risk_factors, attention_weights, intermediate_outputs = self.model(factor_sequences, adj_matrix)
-            
-            # 现在predictions是多个因子 [batch, stocks, num_factors=8]
-            # 我们用这些因子来预测收益率
-            
-            # 处理目标张量维度
-            # target_returns 形状: [batch_size, prediction_horizon, num_stocks]
-            # 我们需要将其转换为多期收益率列表
-            
-            # 使用ASTGNN_Loss模块中的损失函数
-            # 将每个批次的因子矩阵作为F [num_stocks, num_factors]
-            batch_loss = 0.0
-            for b in range(min(batch_size, 5)):  # 限制批次数以避免内存问题
-                F = predictions[b]  # [num_stocks, num_factors] 保持原来的维度
+            # 使用混合精度训练
+            if self.use_amp:
+                with autocast():
+                    # 前向传播
+                    predictions, risk_factors, attention_weights, intermediate_outputs = self.model(factor_sequences, adj_matrix)
+                    
+                    # 计算损失
+                    batch_loss = self._compute_batch_loss(predictions, target_returns, batch_size)
+                    
+                    # 梯度累积
+                    batch_loss = batch_loss / accumulation_steps
+            else:
+                # 标准精度前向传播
+                predictions, risk_factors, attention_weights, intermediate_outputs = self.model(factor_sequences, adj_matrix)
                 
-                # 构建未来多期收益率列表，每个元素形状为 [num_stocks]
-                future_returns_list = []
-                for t in range(target_returns.shape[1]):  # 遍历预测时间步
-                    future_returns_list.append(target_returns[b, t])  # [num_stocks]
+                # 计算损失
+                batch_loss = self._compute_batch_loss(predictions, target_returns, batch_size)
                 
-                batch_loss += self.criterion(F, future_returns_list)
+                # 梯度累积
+                batch_loss = batch_loss / accumulation_steps
             
-            total_batch_loss = batch_loss / min(batch_size, 5)
+            # 反向传播（支持混合精度和梯度累积）
+            if self.use_amp:
+                self.scaler.scale(batch_loss).backward()
+                
+                # 梯度累积控制
+                if (batch_idx + 1) % accumulation_steps == 0:
+                    # 梯度裁剪
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), 
+                        self.config['gradient_clip_norm']
+                    )
+                    
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
+            else:
+                batch_loss.backward()
+                
+                # 梯度累积控制
+                if (batch_idx + 1) % accumulation_steps == 0:
+                    # 梯度裁剪
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), 
+                        self.config['gradient_clip_norm']
+                    )
+                    
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
             
-            # 反向传播
-            self.optimizer.zero_grad()
-            total_batch_loss.backward()
-            
-            # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), 
-                self.config['gradient_clip_norm']
-            )
-            
-            self.optimizer.step()
-            
-            # 计算R²分数（使用因子的第一个维度作为代理）
+            # 计算R²分数（使用单因子输出）
             with torch.no_grad():
                 # 使用第一个时间步的收益率进行R²计算
                 target_for_r2 = target_returns[:, 0, :]  # [batch_size, num_stocks]
-                r2_score = self.calculate_r2_score(predictions[:, :, 0], target_for_r2)
+                r2_score = self.calculate_r2_score(predictions.squeeze(-1), target_for_r2)  # squeeze单因子维度
             
-            total_loss += total_batch_loss.item()
+            total_loss += (batch_loss * accumulation_steps).item()  # 还原真实损失
             total_r2 += r2_score
             
             # 打印进度
             if batch_idx % max(1, num_batches // 5) == 0:
                 logger.info(f"  Epoch {epoch}, Batch {batch_idx}/{num_batches}, "
-                           f"Loss: {total_batch_loss.item():.6f}, R²: {r2_score:.6f}")
+                           f"Loss: {(batch_loss * accumulation_steps).item():.6f}, R²: {r2_score:.6f}")
         
         avg_loss = total_loss / num_batches
         avg_r2 = total_r2 / num_batches
@@ -549,8 +694,8 @@ class RealASTGNNTrainer:
                 targets     # [time, stocks]
             )
             
-            logger.info(f"多因子IC分析结果:")
-            factor_names = [f'Factor_{i}' for i in range(len(ic_results['ic_mean']))]
+            logger.info(f"因子IC分析结果:")
+            factor_names = ['ASTGNN_Factor'] if len(ic_results['ic_mean']) == 1 else [f'Factor_{i}' for i in range(len(ic_results['ic_mean']))]
             
             for i, name in enumerate(factor_names):
                 logger.info(f"{name:15}: IC均值={ic_results['ic_mean'][i]:7.4f}, "
@@ -692,7 +837,79 @@ def main():
     # 开始训练
     trainer.train_model()
     
-    logger.info("真实数据ASTGNN训练完成!")
+    # 训练完成后进行专业回测分析
+    logger.info("=== 开始专业回测分析 ===")
+    
+    try:
+        # 加载保存的因子分析数据
+        import numpy as np
+        data = np.load('factor_analysis_data.npz')
+        factors = torch.from_numpy(data['factors'])  # [time, stocks, factors]
+        targets = torch.from_numpy(data['targets'])  # [time, stocks]
+        
+        logger.info(f"专业回测数据: factors {factors.shape}, targets {targets.shape}")
+        
+        # 从目标收益率反推价格数据（用于专业回测）
+        initial_price = 100.0
+        prices = torch.zeros_like(targets)
+        prices[0] = initial_price
+        
+        for t in range(1, len(targets)):
+            prices[t] = prices[t-1] * (1 + targets[t-1])
+        
+        # 运行专业RankIC分析
+        rank_ic_results = trainer.professional_analyzer.calculate_rank_ic_with_future_returns(
+            factors, prices
+        )
+        
+        # 运行专业分组回测（中证全指和沪深300）
+        backtest_results = {}
+        for universe in ['CSI_ALL', 'HS300']:
+            backtest_results[universe] = trainer.professional_analyzer.group_backtest_analysis(
+                factors, prices, 
+                universe=universe, 
+                factor_idx=0  # 测试第一个因子
+            )
+        
+        logger.info("=== 专业回测分析完成 ===")
+        
+        # 打印总结报告
+        logger.info("\n" + "="*60)
+        logger.info("               专业回测分析报告")
+        logger.info("="*60)
+        
+        # RankIC总结
+        if 'results' in rank_ic_results:
+            ic_results = rank_ic_results['results']
+            if ic_results:
+                avg_rank_ic = np.mean([abs(r['rank_ic_mean']) for r in ic_results.values()])
+                avg_icir = np.mean([abs(r['rank_ic_ir']) for r in ic_results.values()])
+                logger.info(f"\nRankIC分析结果:")
+                logger.info(f"  平均RankIC: {avg_rank_ic:.6f}")
+                logger.info(f"  平均ICIR: {avg_icir:.6f}")
+                logger.info(f"  计算规范: 每隔10个交易日计算一次，使用未来10日收益率")
+        
+        # 分组回测总结
+        for universe, bt_result in backtest_results.items():
+            if 'long_short_stats' in bt_result and bt_result['long_short_stats']:
+                ls_stats = bt_result['long_short_stats']
+                logger.info(f"\n{bt_result['universe']}分组回测结果:")
+                logger.info(f"  年化收益率: {ls_stats['annual_return']:8.2%}")
+                logger.info(f"  信息比率: {ls_stats['information_ratio']:8.4f}")
+                logger.info(f"  最大回撤: {ls_stats['max_drawdown']:8.2%}")
+                logger.info(f"  胜率: {ls_stats['win_rate']:8.2%}")
+                if 'turnover_rate' in bt_result:
+                    turnover = bt_result['turnover_rate']
+                    logger.info(f"  周均单边换手率: {turnover['weekly_turnover_pct']:.2f}%")
+        
+        logger.info("="*60)
+        
+    except Exception as e:
+        logger.error(f"专业回测分析失败: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+    
+    logger.info("真实数据ASTGNN训练和专业回测分析完成!")
 
 
 if __name__ == '__main__':
