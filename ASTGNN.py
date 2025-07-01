@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import logging
 from typing import Optional, Tuple, List
 
 # 导入已有的组件
@@ -9,6 +10,8 @@ from GAT import GraphAttentionLayer, MultiHeadGAT, GAT
 from Res_C import BasicResidualBlock, GraphResidualLayer
 from Full_C import FullyConnectedLayer, GraphFullyConnectedLayer
 
+# 配置日志
+logger = logging.getLogger(__name__)
 
 class W2GATFactorExtractor(nn.Module):
     """W2-GAT因子提取器（对应图中架构）
@@ -36,7 +39,8 @@ class W2GATFactorExtractor(nn.Module):
                  output_size=32,       # 风险因子数量K
                  
                  # 通用参数
-                 dropout=0.1):
+                 dropout=0.1,
+                 verbose=False):
         """
         参数说明：
         - input_size: 每个时间步的输入特征维度（对应图中x_t的维度）
@@ -52,6 +56,7 @@ class W2GATFactorExtractor(nn.Module):
         self.input_size = input_size
         self.gru_hidden_size = gru_hidden_size
         self.output_size = output_size
+        self.verbose = verbose
         
         print(f"构建W2-GAT架构:")
         print(f"  输入维度: {input_size}")
@@ -117,8 +122,9 @@ class W2GATFactorExtractor(nn.Module):
         """
         batch_size, seq_len, num_stocks, input_features = sequential_inputs.shape
         
-        print(f"W2-GAT前向传播:")
-        print(f"  输入形状: {sequential_inputs.shape}")
+        if self.verbose:
+            print(f"W2-GAT前向传播:")
+            print(f"  输入形状: {sequential_inputs.shape}")
         
         # === 1. GRU层处理时序信息 ===
         # 重塑为 [batch_size * num_stocks, seq_len, input_features]
@@ -134,7 +140,8 @@ class W2GATFactorExtractor(nn.Module):
         gru_features = gru_last.view(batch_size, num_stocks, self.gru_hidden_size)
         gru_features = self.dropout(gru_features)
         
-        print(f"  GRU输出形状: {gru_features.shape}")
+        if self.verbose:
+            print(f"  GRU输出形状: {gru_features.shape}")
         
         # === 2. GAT层处理图关系 ===
         # 处理邻接矩阵维度
@@ -151,21 +158,24 @@ class W2GATFactorExtractor(nn.Module):
             attention_weights_list.append(attention)
         
         gat_features = torch.stack(gat_outputs, dim=0)  # [batch, stocks, gat_hidden]
-        print(f"  GAT输出形状: {gat_features.shape}")
+        if self.verbose:
+            print(f"  GAT输出形状: {gat_features.shape}")
         
         # === 3. Res_C层残差连接 ===
         gat_flat = gat_features.view(batch_size * num_stocks, -1)
         res_out = self.res_block(gat_flat)
         res_features = res_out.view(batch_size, num_stocks, -1)
         
-        print(f"  Res-C输出形状: {res_features.shape}")
+        if self.verbose:
+            print(f"  Res-C输出形状: {res_features.shape}")
         
         # === 4. Full_C层输出风险因子 ===
         res_flat = res_features.view(batch_size * num_stocks, -1)
         risk_factors_flat = self.full_c(res_flat)
         risk_factors = risk_factors_flat.view(batch_size, num_stocks, self.output_size)
         
-        print(f"  Full-C输出形状: {risk_factors.shape}")
+        if self.verbose:
+            print(f"  Full-C输出形状: {risk_factors.shape}")
         
         # === 5. NN-Layer额外处理 ===
         # 对应图中的NN-Layer
@@ -173,7 +183,8 @@ class W2GATFactorExtractor(nn.Module):
         enhanced_factors_flat = self.nn_layer(risk_factors_flat)
         enhanced_factors = enhanced_factors_flat.view(batch_size, num_stocks, self.output_size)
         
-        print(f"  NN-Layer输出形状: {enhanced_factors.shape}")
+        if self.verbose:
+            print(f"  NN-Layer输出形状: {enhanced_factors.shape}")
         
         # 中间输出用于分析
         intermediate_outputs = {
@@ -373,7 +384,7 @@ class RelationalEmbeddingLayer(nn.Module):
 
 
 class ASTGNNFactorModel(nn.Module):
-    """完整的ASTGNN因子模型 - 对应图中完整架构"""
+    """完整的ASTGNN因子挖掘模型"""
     
     def __init__(self, 
                  # 输入维度
@@ -398,22 +409,18 @@ class ASTGNNFactorModel(nn.Module):
                  num_predictions=1,
                  
                  # 其他参数
-                 dropout=0.1):
-        """
-        完整ASTGNN架构，对应论文图中的网络结构：
-        
-        1. W2-GAT部分（Cell-X）：Sequential Inputs → GRU → GAT → Res-C → Full-C → 风险因子M
-        2. TGC部分：使用风险因子M进行图卷积
-        3. 预测部分：最终输出预测结果
-        """
+                 dropout=0.1,
+                 verbose=False):  # 添加verbose参数控制输出
         super(ASTGNNFactorModel, self).__init__()
         
-        print(f"=== 构建完整ASTGNN模型 ===")
-        print(f"输入维度: {sequential_input_size}")
-        print(f"风险因子数量: {num_risk_factors}")
-        print(f"TGC模式: {tgc_modes}")
+        self.verbose = verbose  # 保存verbose设置
         
-        # 1. W2-GAT因子提取器（对应图中的Cell-X部分）
+        # 保存基本配置参数
+        self.sequential_input_size = sequential_input_size
+        self.num_risk_factors = num_risk_factors
+        self.num_predictions = num_predictions
+        
+        # 1. W2-GAT因子提取器 (对应图中的Cell-X)
         self.factor_extractor = W2GATFactorExtractor(
             input_size=sequential_input_size,
             gru_hidden_size=gru_hidden_size,
@@ -422,12 +429,13 @@ class ASTGNNFactorModel(nn.Module):
             gat_n_heads=gat_n_heads,
             res_hidden_size=res_hidden_size,
             output_size=num_risk_factors,
-            dropout=dropout
+            dropout=dropout,
+            verbose=verbose  # 传递verbose参数
         )
         
         # 2. TGC关系嵌入层
         self.relational_embedding = RelationalEmbeddingLayer(
-            in_features=sequential_input_size,  # 使用原始输入特征
+            in_features=sequential_input_size,
             hidden_features=tgc_hidden_size,
             out_features=tgc_output_size,
             num_tgc_layers=num_tgc_layers,
@@ -435,23 +443,32 @@ class ASTGNNFactorModel(nn.Module):
             dropout=dropout
         )
         
-        # 3. 预测层（使用已有的Full-C组件）
-        prediction_layer_sizes = [tgc_output_size] + prediction_hidden_sizes + [num_predictions]
+        # 3. 预测层
+        prediction_layers = []
+        current_size = tgc_output_size
         
-        self.prediction_layers = nn.ModuleList()
-        for i in range(len(prediction_layer_sizes) - 1):
-            is_final = (i == len(prediction_layer_sizes) - 2)
-            layer = FullyConnectedLayer(
-                in_features=prediction_layer_sizes[i],
-                out_features=prediction_layer_sizes[i + 1],
-                activation=None if is_final else 'relu',
-                dropout=0 if is_final else dropout,
-                batch_norm=not is_final
-            )
-            self.prediction_layers.append(layer)
+        for hidden_size in prediction_hidden_sizes:
+            prediction_layers.extend([
+                nn.Linear(current_size, hidden_size),
+                nn.ReLU(),
+                nn.BatchNorm1d(hidden_size),
+                nn.Dropout(dropout)
+            ])
+            current_size = hidden_size
+        
+        # 最终输出层
+        prediction_layers.append(nn.Linear(current_size, num_predictions))
+        
+        self.prediction_layers = nn.ModuleList(prediction_layers)
+        
+        logger.info(f"ASTGNN模型初始化完成 (verbose={verbose})")
+        if verbose:
+            logger.info(f"  输入维度: {sequential_input_size}")
+            logger.info(f"  风险因子数量: {num_risk_factors}")
+            logger.info(f"  预测输出数量: {num_predictions}")
     
     def forward(self, sequential_inputs, adj_matrix):
-        """前向传播 - 实现完整的ASTGNN架构
+        """前向传播
         
         参数：
         - sequential_inputs: [batch_size, seq_len, num_stocks, input_features] 对应图中x1,x2,...xT
@@ -465,23 +482,27 @@ class ASTGNNFactorModel(nn.Module):
         """
         batch_size, seq_len, num_stocks, input_features = sequential_inputs.shape
         
-        print(f"\n=== ASTGNN前向传播 ===")
-        print(f"输入形状: {sequential_inputs.shape}")
+        if self.verbose:
+            print(f"\n=== ASTGNN前向传播 ===")
+            print(f"输入形状: {sequential_inputs.shape}")
         
         # 1. 使用W2-GAT提取风险因子矩阵M
         risk_factors, attention_weights, intermediate_outputs = self.factor_extractor(
             sequential_inputs, adj_matrix
         )
         
-        print(f"风险因子矩阵M形状: {risk_factors.shape}")
+        if self.verbose:
+            print(f"风险因子矩阵M形状: {risk_factors.shape}")
         
         # 2. 使用当前时刻的输入特征作为X
         current_features = sequential_inputs[:, -1, :, :]  # [batch, stocks, features]
-        print(f"当前特征X形状: {current_features.shape}")
+        if self.verbose:
+            print(f"当前特征X形状: {current_features.shape}")
         
         # 3. TGC关系嵌入
         embedded_features = self.relational_embedding(current_features, risk_factors)
-        print(f"TGC嵌入后形状: {embedded_features.shape}")
+        if self.verbose:
+            print(f"TGC嵌入后形状: {embedded_features.shape}")
         
         # 4. 预测层
         output = embedded_features
@@ -490,11 +511,13 @@ class ASTGNNFactorModel(nn.Module):
         
         for i, layer in enumerate(self.prediction_layers):
             output_flat = layer(output_flat)
-            print(f"预测层{i+1}输出: {output_flat.shape}")
+            if self.verbose:
+                print(f"预测层{i+1}输出: {output_flat.shape}")
         
         # 重塑回3D
         predictions = output_flat.view(batch_size, num_stocks, -1)
-        print(f"最终预测形状: {predictions.shape}")
+        if self.verbose:
+            print(f"最终预测形状: {predictions.shape}")
         
         # 更新中间输出
         intermediate_outputs.update({

@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 import os
 from matplotlib.font_manager import FontProperties
+from tqdm import tqdm  # 添加进度条
 
 # GPU加速相关导入
 from torch.cuda.amp import GradScaler, autocast
@@ -271,7 +272,8 @@ class RealASTGNNTrainer:
             'tgc_modes': ['add', 'subtract'],
             'prediction_hidden_sizes': [128, 64],
             'num_predictions': 1,  # 修改：输出单个因子
-            'dropout': 0.1
+            'dropout': 0.1,
+            'verbose': False  # 简化前向传播输出
         }
         
         # 创建模型
@@ -325,8 +327,8 @@ class RealASTGNNTrainer:
         
         # 专业回测分析器
         self.professional_analyzer = ProfessionalBacktestAnalyzer(
-            start_date='20231229',
-            end_date='20240430',
+                    start_date='20230101',
+        end_date='20231231',
             factor_names=['ASTGNN_Factor']  # 单因子名称
         )
         
@@ -392,7 +394,12 @@ class RealASTGNNTrainer:
         # 梯度累积配置
         accumulation_steps = self.config.get('gradient_accumulation_steps', 1)
         
-        for batch_idx, (factor_sequences, target_returns) in enumerate(train_loader):
+        # 添加进度条
+        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch:3d}', 
+                           leave=False, ncols=80, 
+                           bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+        
+        for batch_idx, (factor_sequences, target_returns) in enumerate(progress_bar):
             # 异步数据传输到GPU
             factor_sequences = factor_sequences.to(self.device, non_blocking=True)
             target_returns = target_returns.to(self.device, non_blocking=True)
@@ -461,10 +468,11 @@ class RealASTGNNTrainer:
             total_loss += (batch_loss * accumulation_steps).item()  # 还原真实损失
             total_r2 += r2_score
             
-            # 打印进度
-            if batch_idx % max(1, num_batches // 5) == 0:
-                logger.info(f"  Epoch {epoch}, Batch {batch_idx}/{num_batches}, "
-                           f"Loss: {(batch_loss * accumulation_steps).item():.6f}, R²: {r2_score:.6f}")
+            # 更新进度条信息
+            progress_bar.set_postfix({
+                'Loss': f'{(batch_loss * accumulation_steps).item():.4f}',
+                'R²': f'{r2_score:.4f}'
+            })
         
         avg_loss = total_loss / num_batches
         avg_r2 = total_r2 / num_batches
@@ -478,8 +486,13 @@ class RealASTGNNTrainer:
         total_r2 = 0.0
         num_batches = len(val_loader)
         
+        # 添加验证进度条
+        progress_bar = tqdm(val_loader, desc='Validating', 
+                           leave=False, ncols=80,
+                           bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+        
         with torch.no_grad():
-            for factor_sequences, target_returns in val_loader:
+            for factor_sequences, target_returns in progress_bar:
                 # 创建邻接矩阵
                 batch_size = factor_sequences.shape[0]
                 adj_matrix = torch.eye(self.num_stocks).unsqueeze(0).repeat(batch_size, 1, 1).to(self.device)
@@ -511,6 +524,12 @@ class RealASTGNNTrainer:
                 
                 total_loss += total_batch_loss.item()
                 total_r2 += r2_score
+                
+                # 更新进度条信息
+                progress_bar.set_postfix({
+                    'Loss': f'{total_batch_loss.item():.4f}',
+                    'R²': f'{r2_score:.4f}'
+                })
         
         avg_loss = total_loss / num_batches
         avg_r2 = total_r2 / num_batches

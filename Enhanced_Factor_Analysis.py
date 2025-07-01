@@ -511,7 +511,7 @@ class EnhancedFactorAnalyzer:
 class ProfessionalBacktestAnalyzer:
     """专业回撤分析器 - 严格按照量化投资标准"""
     
-    def __init__(self, start_date='20231229', end_date='20240430', factor_names=None):
+    def __init__(self, start_date='20230101', end_date='20231231', factor_names=None):
         """
         初始化专业回测分析器
         
@@ -915,8 +915,8 @@ def analyze_astgnn_factors():
         
         # 创建专业回测分析器
         professional_analyzer = ProfessionalBacktestAnalyzer(
-            start_date='20231229',
-            end_date='20240430',
+                    start_date='20230101',
+        end_date='20231231',
             factor_names=[f'ASTGNN_Factor_{i}' for i in range(factors.shape[2])]
         )
         

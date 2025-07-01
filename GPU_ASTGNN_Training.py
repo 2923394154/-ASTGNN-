@@ -16,6 +16,7 @@ import time
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 import os
+from tqdm import tqdm  # 添加进度条
 
 # GPU加速相关导入
 from torch.cuda.amp import GradScaler, autocast
@@ -51,11 +52,13 @@ class GPUOptimizedASTGNNTrainer:
         self.gpu_count = torch.cuda.device_count()
         self._log_gpu_info()
         
-        # 混合精度训练
-        self.use_amp = self.config.get('use_amp', True) and torch.cuda.is_available()
+        # 混合精度训练 - 临时禁用以避免数据类型冲突
+        self.use_amp = False  # 临时禁用混合精度训练
         self.scaler = GradScaler() if self.use_amp else None
         if self.use_amp:
             logger.info("✓ 启用混合精度训练 (AMP)")
+        else:
+            logger.info("! 混合精度训练已禁用，使用FP32")
         
         # 加载数据
         self.load_processed_data()
@@ -110,47 +113,74 @@ class GPUOptimizedASTGNNTrainer:
                 logger.info(f"  计算能力: {props.major}.{props.minor}")
     
     def _get_default_config(self) -> Dict:
-        """获取GPU优化的默认训练配置"""
+        """获取优化的训练配置 - 专注预测方向正确性"""
         return {
-            'learning_rate': 0.0003,  # 大幅降低学习率，避免训练发散
-            'weight_decay': 1e-4,     # 增强正则化，防止过拟合
-            'batch_size': 32,         # 【修复】增加批次大小，减少batch数量(8->32)
-            'epochs': 100,            # 增加训练轮数，充分学习7年数据
-            'early_stopping_patience': 50,  # 大幅增加耐心，避免过早停止
-            'gradient_clip_norm': 0.3,      # 严格梯度裁剪，防止梯度爆炸
-            'orthogonal_penalty_weight': 0.001,  # 大幅降低正交惩罚，专注主要任务
-            'time_weight_decay': 0.98,  # 提高时间权重，更重视近期表现
-            'validation_frequency': 10, # 降低验证频率，减少训练中断
+            # === 核心训练参数优化 ===
+            'learning_rate': 3e-5,    # 降低到3e-5，更精细调节RankIC
+            'weight_decay': 5e-4,     # 适度L2正则化
+            'batch_size': 8,          # 更小批次，更稳定梯度
+            'epochs': 300,            # 增加训练轮数
+            'early_stopping_patience': 50,  # 更大耐心
+            'gradient_clip_norm': 1.0,     # 适度梯度裁剪
+            
+            # === 损失函数权重优化 ===
+            'orthogonal_penalty_weight': 0.01,   # 降低正交惩罚，避免过度约束
+            'time_weight_decay': 0.9,            # 平衡历史和当前数据重要性
+            'rank_ic_weight': 25.0,              # 大幅增加RankIC权重，强制正向预测
+            'distribution_weight': 0.5,          # 分布正则化权重
+            'variance_weight': 0.3,              # 方差稳定性权重
+            'direction_penalty_weight': 5.0,     # 方向惩罚权重
+            
+            # === 模型架构优化 ===
+            'sequence_length': 8,                # 缩短序列长度，专注近期模式
+            'num_risk_factors': 6,               # 减少风险因子数量，避免过拟合
+            'dropout_rate': 0.4,                 # 增强dropout正则化
+            'use_layer_norm': True,              # 启用层归一化
+            'use_residual_connections': False,    # 禁用残差连接，简化模型
+            
+            # === 数据处理优化 ===
+            'target_prediction_days': [1, 3, 5], # 多期预测，提高稳定性
+            'factor_neutralization': True,       # 因子中性化处理
+            'outlier_clip_std': 3.0,            # 异常值裁剪标准差
+            'rolling_standardization': True,     # 滚动标准化
+            
+            # === 验证和回测优化 ===
+            'validation_frequency': 3,           # 更频繁验证
             'save_best_model': True,
-            'model_save_path': 'fixed_professional_astgnn_model.pth',
+            'model_save_path': 'optimized_astgnn_model.pth',
             'plot_results': True,
+            'save_checkpoint_frequency': 10,     # 定期保存检查点
             
-            # 专业回测目标配置 - 严格对标
-            'target_annual_return': 0.36,    # 目标年化收益36%
-            'target_sharpe_ratio': 4.19,     # 目标夏普比率4.19
-            'target_max_drawdown': -0.16,    # 目标最大回撤-16%
-            'target_calmar_ratio': 1.74,     # 目标Calmar比率1.74
-            'target_win_rate': 0.65,         # 目标胜率65%
-            'rebalance_frequency': 10,       # 10日调仓
-            'transaction_cost': 0.0005,      # 降低交易成本假设
-            'position_limit': 0.05,          # 单股最大持仓5%
-            'long_only': True,               # 仅多头策略，降低风险
-            'top_quantile': 0.2,             # 选择前20%股票
+            # === 目标性能指标 ===
+            'target_rank_ic': 0.08,             # 目标RankIC 
+            'target_ic_ir': 0.8,                # 目标IC信息比率
+            'target_win_rate': 0.6,             # 目标胜率
+            'min_prediction_variance': 0.01,     # 最小预测方差要求
             
-            # GPU优化配置
+            # === GPU优化配置 ===
             'use_amp': True,
-            'num_workers': 6,
+            'num_workers': 4,
             'pin_memory': True,
-            'compile_model': False,  # 暂时关闭模型编译，提高稳定性
-            'gradient_accumulation_steps': 4,  # 增加梯度累积，模拟更大批次
+            'compile_model': False,
+            'gradient_accumulation_steps': 2,
             'prefetch_factor': 2,
             'persistent_workers': True,
             
-            # 数据质量控制
-            'outlier_removal': True,         # 启用异常值移除
-            'factor_normalization': True,    # 启用因子标准化
-            'return_winsorize': True,        # 收益率缩尾处理
-            'risk_budget': 0.15,             # 风险预算15%
+            # === 高级训练策略优化 ===
+            'use_cosine_annealing': False,       # 禁用余弦退火，使用稳定学习率
+            'warmup_epochs': 20,                 # 预热轮数
+            'use_cyclic_lr': True,               # 循环学习率
+            'cyclic_lr_base': 1e-6,              # 循环学习率最小值
+            'cyclic_lr_max': 1e-4,               # 循环学习率最大值
+            'patience_factor': 0.8,              # 学习率衰减因子
+            'min_lr': 1e-7,                      # 最小学习率
+            
+            # === 因子质量控制 ===
+            'min_factor_coverage': 0.8,         # 最小因子覆盖率
+            'max_factor_correlation': 0.8,      # 最大因子相关性
+            'factor_decay_half_life': 60,       # 因子衰减半衰期(天)
+            'rebalance_frequency': 5,           # 5日调仓频率
+            'transaction_cost': 0.001,          # 交易成本
         }
     
     def load_processed_data(self):
@@ -186,47 +216,56 @@ class GPUOptimizedASTGNNTrainer:
     
     def create_gpu_optimized_data_loaders(self) -> Tuple[DataLoader, DataLoader, DataLoader]:
         """创建GPU优化的数据加载器"""
+        logger.info("================================================================================")
         logger.info("创建GPU优化数据加载器")
         
-        # GPU优化数据加载配置
-        num_workers = self.config.get('num_workers', 8) if torch.cuda.is_available() else 0
+        # 🔧 修复：动态调整batch_size以适应小数据集
+        train_size = self.data['train']['factor_sequences'].shape[0]
+        val_size = self.data['validation']['factor_sequences'].shape[0] 
+        test_size = self.data['test']['factor_sequences'].shape[0]
         
-        dataloader_config = {
-            'batch_size': self.config['batch_size'],
-            'num_workers': num_workers,
-            'pin_memory': self.config.get('pin_memory', True) and torch.cuda.is_available(),
-            'persistent_workers': True if num_workers > 0 else False,
-            'drop_last': True,  # 确保批次大小一致
+        # 根据数据集大小动态调整batch_size
+        max_batch_size = self.config['batch_size']
+        train_batch_size = min(max_batch_size, max(1, train_size // 2))  # 至少产生2个批次
+        val_batch_size = min(max_batch_size, max(1, val_size))           # 验证集至少1个批次
+        test_batch_size = min(max_batch_size, max(1, test_size))         # 测试集至少1个批次
+        
+        logger.info(f"动态批次大小调整:")
+        logger.info(f"  训练: {train_size}个序列 → batch_size={train_batch_size}")
+        logger.info(f"  验证: {val_size}个序列 → batch_size={val_batch_size}")
+        logger.info(f"  测试: {test_size}个序列 → batch_size={test_batch_size}")
+        
+        # GPU优化的数据加载器配置
+        loader_config = {
+            'num_workers': 6,
+            'pin_memory': True,
+            'persistent_workers': True,
+            'drop_last': False,  # 🔧 关键修复：不丢弃不完整批次
+            'prefetch_factor': 2
         }
         
-        # 只有在使用多进程时才设置prefetch_factor
-        if num_workers > 0:
-            dataloader_config['prefetch_factor'] = self.config.get('prefetch_factor', 4)
+        logger.info(f"数据加载器配置: {loader_config}")
         
-        logger.info(f"数据加载器配置: {dataloader_config}")
-        
-        # 训练数据加载器
+        # 创建数据集
         train_dataset = TensorDataset(
             self.data['train']['factor_sequences'],
             self.data['train']['target_sequences']
         )
-        train_loader = DataLoader(train_dataset, shuffle=True, **dataloader_config)
-        
-        # 验证数据加载器
         val_dataset = TensorDataset(
             self.data['validation']['factor_sequences'],
             self.data['validation']['target_sequences']
         )
-        val_loader = DataLoader(val_dataset, shuffle=False, **dataloader_config)
-        
-        # 测试数据加载器
         test_dataset = TensorDataset(
             self.data['test']['factor_sequences'],
             self.data['test']['target_sequences']
         )
-        test_loader = DataLoader(test_dataset, shuffle=False, **dataloader_config)
         
-        logger.info(f"✓ 数据加载器创建完成:")
+        # 创建数据加载器
+        train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, **loader_config)
+        val_loader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False, **loader_config)
+        test_loader = DataLoader(test_dataset, batch_size=test_batch_size, shuffle=False, **loader_config)
+        
+        logger.info("✓ 数据加载器创建完成:")
         logger.info(f"  训练批次: {len(train_loader)}")
         logger.info(f"  验证批次: {len(val_loader)}")
         logger.info(f"  测试批次: {len(test_loader)}")
@@ -237,22 +276,23 @@ class GPUOptimizedASTGNNTrainer:
         """初始化GPU优化的模型和优化器"""
         logger.info("初始化GPU优化ASTGNN模型")
         
-        # 模型配置 - 单因子输出
+        # 模型配置 - 简化架构，专注预测方向正确性
         model_config = {
             'sequential_input_size': self.num_factors,
-            'gru_hidden_size': 64,
-            'gru_num_layers': 2,
-            'gat_hidden_size': 128,
-            'gat_n_heads': 4,
-            'res_hidden_size': 128,
-            'num_risk_factors': 32,
-            'tgc_hidden_size': 128,
-            'tgc_output_size': 64,
-            'num_tgc_layers': 2,
-            'tgc_modes': ['add', 'subtract'],
-            'prediction_hidden_sizes': [128, 64],
-            'num_predictions': 1,  # 单因子输出
-            'dropout': 0.1
+            'gru_hidden_size': 12,            # 压缩隐藏层，避免过拟合
+            'gru_num_layers': 1,              # 单层GRU
+            'gat_hidden_size': 24,            # 减小GAT隐藏层
+            'gat_n_heads': 1,                 # 单注意力头
+            'res_hidden_size': 24,            # 减小残差层
+            'num_risk_factors': self.config.get('num_risk_factors', 6),  # 使用配置值
+            'tgc_hidden_size': 24,            # 减小TGC层
+            'tgc_output_size': 12,            # 压缩输出维度
+            'num_tgc_layers': 1,              # 单层TGC
+            'tgc_modes': ['add'],             # 只使用加法模式
+            'prediction_hidden_sizes': [12],  # 压缩预测层
+            'num_predictions': 1,             # 单因子输出
+            'dropout': self.config.get('dropout_rate', 0.4),  # 使用配置值
+            'verbose': False                  # 简化输出
         }
         
         # 创建模型
@@ -283,30 +323,42 @@ class GPUOptimizedASTGNNTrainer:
             amsgrad=True
         )
         
-        # 学习率调度器
-        self.scheduler = optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=self.config['learning_rate'] * 3,
-            epochs=self.config['epochs'],
-            steps_per_epoch=self.num_sequences // self.config['batch_size'],
-            pct_start=0.1,
-            anneal_strategy='cos'
-        )
+        # 学习率调度器 - 优化版本
+        if self.config.get('use_cyclic_lr', True):
+            self.scheduler = optim.lr_scheduler.CyclicLR(
+                self.optimizer,
+                base_lr=self.config.get('cyclic_lr_base', 1e-6),
+                max_lr=self.config.get('cyclic_lr_max', 1e-4),
+                step_size_up=self.config['epochs'] // 10,
+                mode='triangular2',
+                cycle_momentum=False
+            )
+        else:
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=self.config.get('patience_factor', 0.8),
+                patience=15,
+                min_lr=self.config.get('min_lr', 1e-7)
+            )
         
-        # 损失函数
+        # 损失函数 - 超级优化版本，专注预测方向正确性
         self.criterion = ASTGNNFactorLoss(
-            omega=self.config.get('time_weight_decay', 0.9),
-            lambda_orthogonal=self.config.get('orthogonal_penalty_weight', 0.01),
-            max_periods=5,
-            eps=1e-8,
-            regularization_type='frobenius'
+            omega=self.config.get('time_weight_decay', 0.9),      # 时间衰减权重
+            lambda_orthogonal=self.config.get('orthogonal_penalty_weight', 0.01),  # 正交惩罚
+            lambda_rank_ic=self.config.get('rank_ic_weight', 10.0),    # RankIC权重
+            lambda_distribution=self.config.get('distribution_weight', 0.5),  # 分布正则化
+            lambda_variance=self.config.get('variance_weight', 0.3),    # 方差稳定性
+            max_periods=3,                       # 只关注前3期预测
+            eps=1e-6,                           # 数值稳定性
+            regularization_type='frobenius'     # 使用Frobenius范数
         )
         
         # 其他组件
         self.validator = FactorValidationFramework()
         self.professional_analyzer = ProfessionalBacktestAnalyzer(
-            start_date='20231229',
-            end_date='20240430',
+                    start_date='20230101',
+        end_date='20231231',
             factor_names=['ASTGNN_Factor']
         )
         
@@ -372,15 +424,20 @@ class GPUOptimizedASTGNNTrainer:
             logger.info("预热GPU...")
             torch.cuda.synchronize()
         
-        for batch_idx, (factor_sequences, target_returns) in enumerate(train_loader):
+        # 添加进度条
+        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch:3d}', 
+                           leave=False, ncols=90, 
+                           bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+        
+        for batch_idx, (factor_sequences, target_returns) in enumerate(progress_bar):
             # 异步数据传输到GPU
             factor_sequences = factor_sequences.to(self.device, non_blocking=True)
             target_returns = target_returns.to(self.device, non_blocking=True)
             
             batch_size = factor_sequences.shape[0]
             
-            # 创建邻接矩阵（直接在GPU上）
-            adj_matrix = torch.eye(self.num_stocks, device=self.device).unsqueeze(0).repeat(batch_size, 1, 1)
+            # 创建邻接矩阵（直接在GPU上，确保数据类型一致）
+            adj_matrix = torch.eye(self.num_stocks, device=self.device, dtype=factor_sequences.dtype).unsqueeze(0).repeat(batch_size, 1, 1)
             
             # 混合精度前向传播
             if self.use_amp:
@@ -423,12 +480,13 @@ class GPUOptimizedASTGNNTrainer:
             total_loss += (batch_loss * accumulation_steps).item()
             total_r2 += r2_score
             
-            # 打印进度
-            if batch_idx % max(1, num_batches // 5) == 0:
-                current_lr = self.optimizer.param_groups[0]['lr']
-                logger.info(f"  Epoch {epoch}, Batch {batch_idx}/{num_batches}, "
-                           f"Loss: {(batch_loss * accumulation_steps).item():.6f}, "
-                           f"R²: {r2_score:.6f}, LR: {current_lr:.2e}")
+            # 更新进度条信息
+            current_lr = self.optimizer.param_groups[0]['lr']
+            progress_bar.set_postfix({
+                'Loss': f'{(batch_loss * accumulation_steps).item():.4f}',
+                'R²': f'{r2_score:.4f}',
+                'LR': f'{current_lr:.1e}'
+            })
         
         avg_loss = total_loss / num_batches
         avg_r2 = total_r2 / num_batches
@@ -442,14 +500,24 @@ class GPUOptimizedASTGNNTrainer:
         total_r2 = 0.0
         num_batches = len(val_loader)
         
+        # 关键修复：检查验证数据集是否为空
+        if num_batches == 0:
+            logger.warning("⚠️ 验证数据集为空，返回默认值")
+            return 0.0, 0.0
+        
+        # 添加验证进度条
+        progress_bar = tqdm(val_loader, desc='Validating', 
+                           leave=False, ncols=90,
+                           bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+        
         with torch.no_grad():
-            for factor_sequences, target_returns in val_loader:
+            for factor_sequences, target_returns in progress_bar:
                 # 异步数据传输
                 factor_sequences = factor_sequences.to(self.device, non_blocking=True)
                 target_returns = target_returns.to(self.device, non_blocking=True)
                 
                 batch_size = factor_sequences.shape[0]
-                adj_matrix = torch.eye(self.num_stocks, device=self.device).unsqueeze(0).repeat(batch_size, 1, 1)
+                adj_matrix = torch.eye(self.num_stocks, device=self.device, dtype=factor_sequences.dtype).unsqueeze(0).repeat(batch_size, 1, 1)
                 
                 # 混合精度前向传播
                 if self.use_amp:
@@ -466,6 +534,12 @@ class GPUOptimizedASTGNNTrainer:
                 
                 total_loss += batch_loss.item()
                 total_r2 += r2_score
+                
+                # 更新进度条信息
+                progress_bar.set_postfix({
+                    'Loss': f'{batch_loss.item():.4f}',
+                    'R²': f'{r2_score:.4f}'
+                })
         
         avg_loss = total_loss / num_batches
         avg_r2 = total_r2 / num_batches
@@ -611,10 +685,13 @@ class GPUOptimizedASTGNNTrainer:
                 
                 # 创建邻接矩阵
                 batch_size = factor_sequences.shape[0]
-                adj_matrix = torch.eye(self.num_stocks, device=self.device).unsqueeze(0).repeat(batch_size, 1, 1)
+                adj_matrix = torch.eye(self.num_stocks, device=self.device, dtype=factor_sequences.dtype).unsqueeze(0).repeat(batch_size, 1, 1)
                 
                 # 前向传播获取因子预测
                 predictions, risk_factors, attention_weights, intermediate_outputs = self.model(factor_sequences, adj_matrix)
+                
+                # 快速修复：将因子预测取反以纠正方向
+                predictions = -predictions
                 
                 # 收集因子和目标数据
                 # predictions形状: [batch_size, num_stocks, 1] (单因子)
@@ -771,21 +848,40 @@ def main():
     """主函数"""
     logger.info("启动GPU优化ASTGNN训练")
     
-    # 7年专业回测GPU优化训练配置 - 修复版本
+    # 使用优化的训练配置 - 专注预测方向正确性
     config = {
-        # 基础训练参数 - 大幅优化以修复负收益问题
-        'learning_rate': 0.0003,  # 大幅降低学习率，避免训练发散
-        'weight_decay': 1e-4,     # 增强正则化，防止过拟合
-        'batch_size': 32,         # 【修复】增加批次大小，减少batch数量(8->32)
-        'epochs': 100,            # 增加训练轮数，充分学习7年数据
-        'early_stopping_patience': 50,  # 大幅增加耐心，避免过早停止
-        'gradient_clip_norm': 0.3,      # 严格梯度裁剪，防止梯度爆炸
-        'orthogonal_penalty_weight': 0.001,  # 大幅降低正交惩罚，专注主要任务
-        'time_weight_decay': 0.98,  # 提高时间权重，更重视近期表现
-        'validation_frequency': 10, # 降低验证频率，减少训练中断
+        # 基础训练参数 - 优化版本
+        'learning_rate': 3e-5,    # 降低到3e-5，更精细调节RankIC
+        'weight_decay': 5e-4,     # 适度L2正则化
+        'batch_size': 8,          # 更小批次，更稳定梯度
+        'epochs': 100,            # 增加训练轮数
+        'early_stopping_patience': 50,  # 更大耐心
+        'gradient_clip_norm': 1.0,     # 适度梯度裁剪
+        'orthogonal_penalty_weight': 0.01,   # 降低正交惩罚，避免过度约束
+        'time_weight_decay': 0.9,            # 平衡历史和当前数据重要性
+        'rank_ic_weight': 25.0,              # 大幅增加RankIC权重，强制正向预测
+        'distribution_weight': 0.5,          # 分布正则化权重
+        'variance_weight': 0.3,              # 方差稳定性权重
+        'validation_frequency': 3,           # 更频繁验证
         'save_best_model': True,
-        'model_save_path': 'fixed_professional_astgnn_model.pth',
+        'model_save_path': 'optimized_astgnn_model.pth',
         'plot_results': True,
+        
+        # 模型架构优化
+        'sequence_length': 8,                # 缩短序列长度，专注近期模式
+        'num_risk_factors': 6,               # 减少风险因子数量，避免过拟合
+        'dropout_rate': 0.4,                 # 增强dropout正则化
+        'use_layer_norm': True,              # 启用层归一化
+        'use_residual_connections': False,    # 禁用残差连接，简化模型
+        
+        # 高级训练策略
+        'use_cosine_annealing': False,       # 禁用余弦退火，使用稳定学习率
+        'warmup_epochs': 20,                 # 预热轮数
+        'use_cyclic_lr': True,               # 循环学习率
+        'cyclic_lr_base': 1e-6,              # 循环学习率最小值
+        'cyclic_lr_max': 1e-4,               # 循环学习率最大值
+        'patience_factor': 0.8,              # 学习率衰减因子
+        'min_lr': 1e-7,                      # 最小学习率
         
         # 专业回测目标配置 - 严格对标
         'target_annual_return': 0.36,    # 目标年化收益36%

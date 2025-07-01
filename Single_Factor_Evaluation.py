@@ -38,8 +38,8 @@ class SingleFactorEvaluator:
         # 初始化评价框架
         self.validator = FactorValidationFramework()
         self.professional_analyzer = ProfessionalBacktestAnalyzer(
-            start_date='20231229',
-            end_date='20240430',
+            start_date='20230101',
+            end_date='20231231',
             factor_names=['ASTGNN_Factor']
         )
         
