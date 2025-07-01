@@ -1,397 +1,196 @@
-# ASTGNN 多因子挖掘模型
+# ASTGNN因子挖掘模型复现
 
-## 项目简介
+## 模型概述
 
-ASTGNN (Adaptive Spatio-Temporal Graph Neural Network) 是一个基于深度学习的**多因子挖掘模型**，融合了图神经网络、时序建模和注意力机制，专门用于金融市场的因子提取和风险预测。
+本项目复现了融合基本面信息的ASTGNN（Adaptive Spatio-Temporal Graph Neural Network）因子挖掘模型，该模型来源于【东方证券】因子选股系列之一〇四的研究工作。ASTGNN通过图神经网络架构捕捉股票间的空间相关性和时间序列特征，结合Barra基本面因子进行因子挖掘。
 
-## 项目特色
+## 数据配置
 
-### 最新解决的技术问题
+### 数据源
+- **股价数据**: 日频股价数据（开高低收量）
+- **基本面数据**: Barra多因子模型风险因子暴露度
+- **数据格式**: 股价数据采用feather格式，Barra数据采用parquet格式
 
-1. **张量维度不匹配问题** - 完美解决多期预测的损失函数计算
-2. **张量内存布局问题** - 修复 `view()` 连续性错误  
-3. **IC计算维度错误** - 正确处理3维因子张量的IC分析
-4. **数据预处理流程** - 优化从Barra因子到ASTGNN训练的完整pipeline
+### 时间范围
+- **总体数据期间**: 2023年1月1日 - 2023年12月31日（完整一年，约250个交易日）
+- **数据分割比例**: 70% 训练集 / 15% 验证集 / 15% 测试集
+- **训练数据**: 2023年1月1日 - 2023年8月31日（约175个交易日）
+- **验证数据**: 2023年9月1日 - 2023年10月15日（约32个交易日）
+- **测试数据**: 2023年10月16日 - 2023年12月31日（约55个交易日）
 
-### 核心技术亮点
+### 股票范围
+- **股票池**: 中国A股市场
+- **股票数量**: 1228只（经过数据质量筛选）
+- **筛选标准**: 
+  - 最少30个交易日的历史数据
+  - 最大缺失率不超过30%
+  - 通过异常值检测和数据质量验证
 
-- **8因子并行生成**: 从单一收益预测升级为多维因子生成器
-- **完整IC分析**: 支持时间序列IC、RankIC、ICIR等专业指标
-- **论文标准损失**: 时间加权R²损失 + 因子正交惩罚项
-- **图神经网络**: GAT+GRU+残差连接的混合架构
-- **生产级质量**: 建立了完整的因子有效性验证框架
+## 模型架构
 
-### 架构创新
+### ASTGNN核心组件
+- **图注意力机制（GAT）**: 捕捉股票间的动态相关性
+- **时间卷积网络**: 提取时间序列特征
+- **自适应邻接矩阵**: 基于因子相关性动态构建股票关联图
+- **多头注意力**: 增强模型的表征能力
 
-```
-序列输入 → GRU时序建模 → GAT图卷积 → 残差连接 → 全连接 → 8因子输出
-    ↓           ↓             ↓          ↓         ↓         ↓
-Barra因子   时间依赖     股票关系     信息保持    特征映射   风险因子
-```
+### 模型参数
+- **隐藏维度**: 64
+- **注意力头数**: 8
+- **图卷积层数**: 2
+- **时间卷积层数**: 2
+- **序列长度**: 20个交易日
+- **预测时间跨度**: 10个交易日
 
-## 项目结构
+### 训练配置
+- **优化器**: AdamW
+- **学习率**: 0.001
+- **批次大小**: 1000
+- **训练轮数**: 200 epochs
+- **早停策略**: 连续10个epoch验证loss不改善
+- **损失函数**: RankIC导向损失函数
+  - RankIC损失权重: 5.0
+  - 分布正则化权重: 1.0
+  - 方差稳定性权重: 0.5
 
-### 核心文件
+## 因子构建
 
-```
-ASTGNN/
-├── Real_ASTGNN_Training.py       # 多因子训练主程序 (最新)
-├── ASTGNN.py                     # 核心模型架构
-├── Enhanced_Factor_Analysis.py   # 增强因子分析工具
-├── ASTGNN_Loss.py               # 专用损失函数
-├── BarraFactorSimulator.py       # Barra因子模拟器
-├── FactorValidation.py           # 因子有效性验证
-├── DataPreprocessor.py           # 数据预处理器
-├── GAT.py                       # 图注意力网络
-├── Res_C.py                     # 残差连接层
-├── Full_C.py                    # 全连接层
-└── requirements.txt             # 依赖包列表
-```
+### 输入特征
+- **Barra风险因子**: 包含多个风格和行业因子的暴露度
+- **技术指标**: 
+  - 多期收益率（1日、5日、10日、20日）
+  - 波动率指标（5日、20日滚动标准差）
+  - 价格技术指标（移动平均线比率）
+  - 成交量指标（成交量比率）
+  - 动量指标（5日、20日动量）
 
-### 训练结果文件
+### 目标变量
+- **预测目标**: 未来10日累积收益率
+- **标准化方式**: RobustScaler标准化
 
-```
-training_results/
-├── astgnn_training_results_*.png     # 训练过程可视化
-├── enhanced_ic_analysis_*.png        # IC分析图表
-└── factor_analysis_data.npz          # 因子分析数据
-```
+## 模型性能
 
-### 模型文件
+### 最新训练结果（2023年数据）
+- **数据维度**: 33个时间步 × 1228只股票 × 1个因子
+- **有效样本数**: 40,524个
+- **数据覆盖率**: 100%
 
-```
-├── real_astgnn_best_model.pth        # 最新训练的最佳模型
-├── astgnn_best_model.pth            # 历史模型备份
-├── processed_astgnn_data.pt         # 预处理后的训练数据
-└── astgnn_training_data.pt          # 原始训练数据
-```
+### 因子统计特征
+- **因子均值**: 0.099130
+- **因子标准差**: 0.203739
+- **偏度**: -0.1769
+- **峰度**: -0.0724
+- **分布范围**: [-0.550151, 0.667651]
 
-## 快速开始
+### 预测性能指标
+- **皮尔逊相关系数**: 0.043960 (p < 0.001)
+- **斯皮尔曼相关系数**: 0.055605 (p < 0.001)
+- **Kendall Tau**: 0.036465 (p < 0.001)
+- **方向预测准确率**: 52.49%
+- **R²分数**: -0.041491
 
-### 环境配置
+### IC分析结果
+#### 专业RankIC（每10日采样）
+- **RankIC均值**: 0.227636
+- **RankIC标准差**: 0.029327
+- **RankIC信息比率**: 7.762009
+- **RankIC胜率**: 100%
+- **有效计算期数**: 3期
 
+#### 传统IC分析
+- **IC均值**: 0.047852
+- **IC标准差**: 0.099390
+- **IC信息比率**: 0.481458
+- **IC胜率**: 72.73%
+
+## 回测分析
+
+### 分位数分组回测
+| 分位数组 | 平均收益率 | 收益率标准差 | 样本数量 |
+|---------|-----------|-------------|----------|
+| Q1 (最低) | 0.071919 | 0.677554 | 8105 |
+| Q2 | 0.131504 | 0.869484 | 8105 |
+| Q3 | 0.143996 | 0.851618 | 8104 |
+| Q4 | 0.170021 | 0.903517 | 8105 |
+| Q5 (最高) | 0.175907 | 0.803281 | 8105 |
+
+### 多空策略表现
+- **Q5组收益率**: 17.59%
+- **Q1组收益率**: 7.19%
+- **多空收益差**: 10.40%
+- **年化夏普比率**: 2.6662
+
+### 回测参数设置
+- **RankIC计算频率**: 每10个交易日
+- **未来收益计算窗口**: T+1至T+11日（10个交易日）
+- **分组数量**: 5个分位数组
+- **重平衡频率**: 周度（每5个交易日）
+
+## 技术实现
+
+### 硬件要求
+- **GPU**: 支持CUDA的GPU（推荐RTX 3090或以上）
+- **内存**: 24GB RAM（可配置）
+- **存储**: 50GB可用空间
+
+### 软件环境
+- **Python**: 3.8+
+- **PyTorch**: 1.12+
+- **CUDA**: 11.7+
+- **其他依赖**: pandas, numpy, scikit-learn, matplotlib
+
+### 数据预处理优化
+- **CPU内存限制**: 24GB（可配置）
+- **GPU内存阈值**: 80%
+- **批次处理**: 支持大规模数据的分批处理
+- **内存映射**: 启用内存映射优化数据加载
+- **异常值处理**: 股票级别的异常值检测和缩尾处理
+
+## 使用方法
+
+### 1. 数据预处理
 ```bash
-# 安装依赖
-pip install -r requirements.txt
-
-# 确保有以下主要包
-pip install torch torchvision torchaudio
-pip install numpy pandas matplotlib seaborn
-pip install scikit-learn scipy
+python DataPreprocessor.py
 ```
 
-### 一键训练 (推荐)
-
+### 2. 模型训练
 ```bash
-# 运行最新的多因子训练
-python Real_ASTGNN_Training.py
+python GPU_ASTGNN_Training.py
 ```
 
-**训练输出**:
-- 8个风险因子的神经网络模型
-- 完整的训练过程可视化图表
-- 因子IC分析和有效性评估
-- 最佳模型自动保存
-
-### 数据预处理
-
-```python
-from DataPreprocessor import RealDataPreprocessor
-
-# 处理真实市场数据
-preprocessor = RealDataPreprocessor()
-preprocessor.process_real_data()  # 生成 processed_astgnn_data.pt
+### 3. 因子评估
+```bash
+python Single_Factor_Evaluation.py
 ```
 
-### 因子分析
 
-```python
-from Enhanced_Factor_Analysis import analyze_astgnn_factors
+## 关键改进
 
-# 运行综合因子分析
-results = analyze_astgnn_factors()
-```
+### 数据处理优化
+- 时间范围从3个月扩展到完整一年
+- CPU内存限制从6GB提升到24GB
+- 修复时间序列创建失败问题
+- 优化GPU/CPU混合处理策略
 
-## 技术详解
+### 模型训练优化
+- 实现RankIC导向的损失函数
+- 添加动态权重调整机制
+- 改进验证数据集划分策略
+- 增强异常处理和错误恢复
 
-### 1. 多因子训练架构
+### 因子评估增强
+- 实现专业级RankIC计算
+- 添加分位数分组回测
+- 完善IC衰减分析
+- 提供详细的可视化输出
 
-**Real_ASTGNN_Training.py** 实现了完整的多因子训练流程：
+## 模型局限性
 
-```python
-# 关键技术特性
-- 批次大小: 4 (优化内存使用)
-- 学习率: 0.002 (动态调整)
-- 因子数量: 8 (专业化风险因子)
-- 预测期数: 5 (多期收益预测)
-- 早停机制: 20轮patience
-- 梯度裁剪: 0.5 (防止梯度爆炸)
-```
+1. **数据依赖**: 模型性能高度依赖输入数据的质量和完整性
+2. **市场适应性**: 模型在不同市场环境下的稳定性需要进一步验证
+3. **计算复杂度**: 图神经网络的计算复杂度较高，对硬件要求较严格
+4. **过拟合风险**: 在有限的数据集上训练可能存在过拟合风险
 
-### 2. ASTGNN模型架构
+## 参考文献
 
-```python
-# 模型配置
-{
-    'sequential_input_size': 10,      # Barra因子输入
-    'gru_hidden_size': 64,           # GRU隐藏层
-    'gat_hidden_size': 128,          # GAT隐藏层  
-    'gat_n_heads': 4,                # 注意力头数
-    'num_risk_factors': 32,          # 中间风险因子
-    'num_predictions': 8,            # 最终输出因子数
-    'dropout': 0.1                   # 防过拟合
-}
-```
-
-### 3. 损失函数设计
-
-**ASTGNN_Loss.py** 实现了论文标准的损失函数：
-
-```python
-# 时间加权R²损失
-Loss = Σ(t=1 to T) ω^t * (1 - R²(F, y_t)) + λ * ||corr(F,F)||²
-
-# 其中:
-# ω: 时间衰减权重 (0.9)
-# R²: 因子对收益的解释度
-# λ: 正交惩罚权重 (0.01)
-```
-
-### 4. 解决的关键问题
-
-#### 问题1: 张量维度不匹配
-
-```python
-# 修复前: 2维张量传入1维损失函数
-future_returns_list = [target_returns[b]]  # [5, 1448] - 错误
-
-# 修复后: 正确构造1维张量列表  
-future_returns_list = []
-for t in range(target_returns.shape[1]):  # 遍历5个时间步
-    future_returns_list.append(target_returns[b, t])  # [1448] - 正确
-```
-
-#### 问题2: 张量内存布局
-
-```python
-# 修复前: view() 连续性错误
-pred_flat = predictions.view(-1)
-
-# 修复后: reshape() 自动处理连续性
-pred_flat = predictions.reshape(-1)
-```
-
-#### 问题3: IC分析维度处理
-
-```python
-# 修复前: 3维目标张量导致IC计算失败
-targets: [batch, prediction_horizon, stocks]
-
-# 修复后: 选择第一个预测期进行IC分析
-if targets.dim() == 3:
-    targets = targets[:, 0, :]  # [batch, stocks]
-```
-
-## 训练结果
-
-### 模型性能
-
-- **因子数量**: 8个专业化风险因子
-- **股票覆盖**: 1,448只A股
-- **时间序列**: 30天历史 → 5天预测
-- **模型参数**: ~45万可训练参数
-- **训练效果**: 损失稳定收敛，R²持续改善
-
-### 因子统计
-
-最新训练生成的8个因子统计信息：
-
-```
-Factor 0: 均值=-0.3260, 标准差=0.1403, 范围=[-1.10, 0.79]
-Factor 1: 均值=+0.0998, 标准差=0.1506, 范围=[-0.93, 1.89] 
-Factor 2: 均值=-0.2426, 标准差=0.1959, 范围=[-1.80, 2.37]
-Factor 3: 均值=+0.0678, 标准差=0.2298, 范围=[-1.55, 1.42]
-Factor 4: 均值=-0.0759, 标准差=0.1889, 范围=[-1.86, 1.37]
-Factor 5: 均值=+0.1555, 标准差=0.1783, 范围=[-1.23, 1.62]
-Factor 6: 均值=-0.0415, 标准差=0.1794, 范围=[-2.10, 1.13]
-Factor 7: 均值=-0.1320, 标准差=0.1723, 范围=[-1.59, 1.01]
-```
-
-**因子质量评估**:
-- 因子分布合理，无异常值
-- 标准差适中，不同因子有差异化特征
-- 正负因子平衡，符合市场中性要求
-
-### 可视化结果
-
-训练完成后自动生成：
-
-1. **训练过程图表** (`astgnn_training_results_*.png`)
-   - 损失曲线 (训练/验证)
-   - R²分数曲线
-   - 学习率变化
-   - 训练统计摘要
-
-2. **IC分析图表** (`enhanced_ic_analysis_*.png`)
-   - 因子IC时间序列
-   - IC分布直方图
-   - 累积IC曲线
-   - 因子相关性热力图
-
-## 高级功能
-
-### 1. 增强因子分析
-
-```python
-from Enhanced_Factor_Analysis import analyze_astgnn_factors
-
-# 综合因子分析
-results = analyze_astgnn_factors()
-
-# 输出包含:
-# - IC/RankIC对比分析
-# - 因子评级 (A+/A/B+/B/C/D)  
-# - 统计显著性检验
-# - 分组回测结果
-# - 智能优化建议
-```
-
-### 2. 自定义训练配置
-
-```python
-# 修改训练参数
-config = {
-    'learning_rate': 0.002,          # 学习率
-    'batch_size': 4,                 # 批次大小
-    'epochs': 150,                   # 训练轮数
-    'early_stopping_patience': 20,   # 早停耐心
-    'orthogonal_penalty_weight': 0.003  # 正交惩罚
-}
-
-trainer = RealASTGNNTrainer(config=config)
-trainer.train_model()
-```
-
-### 3. 模型加载和推理
-
-```python
-# 加载训练好的模型
-trainer = RealASTGNNTrainer()
-trainer.load_model('real_astgnn_best_model.pth')
-
-# 进行推理
-with torch.no_grad():
-    factors = trainer.model(sequences, adj_matrix)
-    # factors: [batch, stocks, 8factors]
-```
-
-## 开发指南
-
-### 主要模块说明
-
-1. **Real_ASTGNN_Training.py**: 多因子训练主程序
-   - 数据加载和预处理
-   - 模型训练和验证  
-   - 因子有效性分析
-   - 结果可视化
-
-2. **ASTGNN.py**: 核心神经网络架构
-   - GRU时序建模
-   - GAT图卷积  
-   - 残差连接
-   - 多因子输出层
-
-3. **Enhanced_Factor_Analysis.py**: 因子分析工具
-   - IC计算和分析
-   - 分组回测
-   - 可视化图表
-   - 优化建议
-
-4. **DataPreprocessor.py**: 数据预处理
-   - Barra因子特征工程
-   - 收益率计算
-   - 数据标准化
-   - 序列构造
-
-### 扩展开发
-
-```python
-# 添加新的因子类型
-class CustomFactor:
-    def compute_factor(self, data):
-        # 实现自定义因子计算
-        pass
-
-# 修改模型架构
-class ExtendedASTGNN(ASTGNNFactorModel):
-    def __init__(self, **config):
-        super().__init__(**config)
-        # 添加新的网络层
-```
-
-## 故障排除
-
-### 常见问题
-
-1. **CUDA内存不足**
-   ```python
-   # 解决方案: 减小批次大小
-   config['batch_size'] = 2  # 默认4 → 2
-   ```
-
-2. **训练收敛慢**
-   ```python
-   # 解决方案: 调整学习率
-   config['learning_rate'] = 0.005  # 增大学习率
-   ```
-
-3. **因子相关性过高**
-   ```python
-   # 解决方案: 增加正交惩罚
-   config['orthogonal_penalty_weight'] = 0.01  # 增大惩罚权重
-   ```
-
-### 调试工具
-
-```python
-# 检查数据形状
-print("因子序列形状:", factor_sequences.shape)
-print("目标形状:", target_returns.shape)
-
-# 监控训练过程
-logger.info(f"Epoch {epoch}, Loss: {loss:.6f}, R²: {r2:.6f}")
-
-# 验证因子质量
-ic_results = validator.compute_information_coefficient(factors, returns)
-```
-
-## 技术文档
-
-- [ASTGNN架构分析](ASTGNN_Architecture_Analysis.md)
-- [Barra因子模型](Barra.md)  
-- [因子验证框架](FactorValidation.py)
-- [数据预处理指南](DataPreprocessor.py)
-
-## 项目成就
-
-- **完整解决训练问题**: 张量维度、内存布局、IC计算等技术难题
-- **实现多因子架构**: 从单一预测升级为8因子生成器
-- **建立评估体系**: 完整的因子有效性验证框架
-- **优化训练流程**: 自动早停、模型保存、结果可视化
-- **提供生产工具**: 可直接用于实际量化投资的完整pipeline
-
-## 许可证
-
-MIT License
-
-## 贡献
-
-欢迎提交Issue和Pull Request来改进项目！
-
-## 联系方式
-
-如有问题请创建Issue或联系项目维护者。
-
----
-
-**本项目展示了深度学习在量化金融中的强大潜力，通过系统性的技术创新和问题解决，成功构建了一个完整的多因子挖掘和风险建模框架。** 
+- 【东方证券】融合基本面信息的ASTGNN因子挖掘模型——因子选股系列之一〇四
