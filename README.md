@@ -2,7 +2,140 @@
 
 ## 模型概述
 
-本项目复现了融合基本面信息的ASTGNN（Adaptive Spatio-Temporal Graph Neural Network）因子挖掘模型，该模型来源于【东方证券】因子选股系列之一〇四的研究工作。ASTGNN通过图神经网络架构捕捉股票间的空间相关性和时间序列特征，结合Barra基本面因子进行因子挖掘。
+本项目复现了融合基本面信息的ASTGNN（Adaptive Spatio-Temporal Graph Neural Network）因子挖掘模型，该模型来源于【东方证券】融合基本面信息的 ASTGNN 因子挖掘模型————因子选股系列之一〇四的研究工作。ASTGNN通过图神经网络架构捕捉股票间的空间相关性和时间序列特征，结合Barra基本面因子进行因子挖掘。
+
+## 项目文件说明
+
+### 核心模型文件
+
+#### `ASTGNN.py`
+**主要ASTGNN模型实现**
+- **W2GATFactorExtractor**: W2-GAT因子提取器，包含GRU→GAT→Res-C→Full-C的完整流程
+- **TimeGraphConvolution**: 时间图卷积层，实现动量效应（加法）和中性化效应（减法）
+- **RelationalEmbeddingLayer**: 关系嵌入层，多层TGC处理股票关系
+- **ASTGNNFactorModel**: 完整的ASTGNN模型，融合时序和横截面信息
+
+#### `ASTGNN_Loss.py`
+**专门的损失函数设计**
+- **ASTGNNFactorLoss**: RankIC导向的损失函数
+- 直接优化Spearman相关系数（RankIC）
+- 包含分布正则化和方差稳定性约束
+- 支持多期收益率的时间加权损失
+
+#### `GAT.py`
+**图注意力网络基础组件**
+- **GraphAttentionLayer**: 单头图注意力层
+- **MultiHeadGAT**: 多头图注意力机制
+- **GAT**: 完整的图注意力网络，用于节点分类
+
+#### `Res_C.py`
+**残差连接组件**
+- **BasicResidualBlock**: 基本残差块，防止梯度消失
+- **ConvResidualBlock**: 卷积残差块（2D数据）
+- **GraphResidualLayer**: 图网络中的残差连接
+- **ResidualGAT**: 带残差连接的GAT网络
+
+#### `Full_C.py`
+**全连接层组件**
+- **FullyConnectedLayer**: 标准全连接层，支持BatchNorm和多种激活函数
+- **MultiLayerFullyConnected**: 多层全连接网络
+- **GraphFullyConnectedLayer**: 适用于图数据的全连接层，支持LayerNorm
+
+### 训练和评估文件
+
+#### `ASTGNN_Training.py`（已弃用）
+**基础ASTGNN训练框架**
+- **ASTGNNDataset**: 数据集类，处理序列数据和目标收益率
+- **ASTGNNTrainer**: 训练器类，包含完整的训练循环
+- 支持早停、梯度裁剪、学习率调度
+- 集成因子验证和可视化功能
+
+#### `GPU_ASTGNN_Training.py`
+**GPU优化版ASTGNN训练脚本**
+- **GPUOptimizedASTGNNTrainer**: GPU优化的训练器，支持混合精度训练
+- 多GPU支持和异步数据传输，大幅提升训练速度
+- 优化的训练配置，专注RankIC和预测方向正确性
+- 包含cuDNN自动调优、TF32加速、内存管理等GPU优化
+- 循环学习率、梯度累积等高级训练策略
+
+#### `Single_Factor_Evaluation.py`
+**单因子专业评价脚本**
+- **SingleFactorEvaluator**: 专业级单因子评价器
+- 全面的IC分析（Pearson、Spearman、Kendall）
+- 专业RankIC计算，每10日采样T+1至T+11日收益
+- 分位数分组回测和风险调整收益分析
+- 因子分布统计和预测性能可视化
+
+### 数据处理文件
+
+#### `DataPreprocessor.py`
+**全面的数据预处理器**
+- **ASTGNNDataPreprocessor**: 主数据预处理类
+- 支持股价数据和Barra因子数据的加载和清洗
+- GPU加速的数据处理和特征工程
+- 序列数据创建和邻接矩阵构建
+- 内存优化和大规模数据处理支持
+
+#### `BarraFactorSimulator.py`
+**Barra因子数据模拟器**
+- **BarraFactorSimulator**: 无真实数据时用于模拟21个Barra风格因子
+- 基于真实Barra模型的统计特性
+- 生成具有时间序列连续性的因子数据
+- 支持因子间相关性和非线性效应模拟
+
+### 文档和配置文件
+
+#### `README.md`
+**项目主文档**
+- 项目概述和模型架构说明
+- 详细的性能指标和回测结果
+- 使用方法和技术实现指南
+
+#### `ASTGNN_Architecture_Analysis.md`
+**ASTGNN架构深度分析**
+- 网络结构详解和数学原理
+- 时间图卷积（TGC）层的金融解释
+- 加法/减法模式的理论基础
+- 与传统方法的对比分析
+
+#### `Barra.md`
+**Barra因子模型说明**
+- Barra CNE5/CNE6模型的21个风格因子定义
+- 各因子的计算方法和金融含义
+- 因子分类和统计特性
+
+#### `requirements.txt`
+**项目依赖列表**
+- PyTorch 1.9.0+（深度学习框架）
+- pandas、numpy（数据处理）
+- scikit-learn（机器学习工具）
+- matplotlib、seaborn（可视化）
+- 其他必要的Python包
+
+### 数据文件
+
+#### `factor_analysis_data.npz`
+**预处理的因子分析数据**
+- 包含因子矩阵、收益率数据和元数据
+- NumPy压缩格式，用于快速加载和分析
+
+#### `barra_Exposure(2).`
+**Barra因子暴露度数据**
+- Parquet格式的Barra因子数据
+- 包含21个风格因子的历史暴露度
+
+#### `stock_price_vol_d.txt`
+**股价和成交量数据**
+- Feather格式的日频股价数据
+- 包含开高低收和成交量信息
+
+### 训练结果文件夹
+
+#### `training_results/`
+**训练结果和可视化**
+- `astgnn_training_results_*.png`: 训练损失和指标图
+- `enhanced_ic_analysis_*.png`: 增强IC分析图
+- 各时间戳的训练结果记录
 
 ## 数据配置
 
